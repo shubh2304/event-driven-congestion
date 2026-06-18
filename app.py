@@ -139,18 +139,22 @@ html, body, [class*="css"] {
 # ─── Load Models & Lookups ─────────────────────────────────────
 @st.cache_resource
 def load_models():
+    import json
     return {
-        'priority': joblib.load('models/priority_classifier.pkl'),
-        'closure': joblib.load('models/closure_classifier.pkl'),
-        'duration': joblib.load('models/duration_regressor.pkl'),
-        'cluster_profile': joblib.load('models/cluster_profiles.pkl'),
-        'cluster_points': joblib.load('models/cluster_points.pkl'),
-        'features': joblib.load('models/feature_list.pkl'),
-        'geohash_lookup': joblib.load('models/geohash_lookup.pkl'),
-        'zone_hour_lookup': joblib.load('models/zone_hour_lookup.pkl'),
+        'priority':          joblib.load('models/priority_classifier.pkl'),
+        'closure':           joblib.load('models/closure_classifier.pkl'),
+        'duration':          joblib.load('models/duration_regressor.pkl'),
+        'cluster_profile':   joblib.load('models/cluster_profiles.pkl'),
+        'cluster_points':    joblib.load('models/cluster_points.pkl'),
+        'features_priority': joblib.load('models/feature_list_priority.pkl'),  # no geo_high_priority_rate
+        'features':          joblib.load('models/feature_list.pkl'),            # closure + duration
+        'geohash_lookup':    joblib.load('models/geohash_lookup.pkl'),
+        'zone_hour_lookup':  joblib.load('models/zone_hour_lookup.pkl'),
         'corridor_risk_lookup': joblib.load('models/corridor_risk_lookup.pkl'),
-        'global_medians': joblib.load('models/global_medians.pkl'),
-        'closure_best_thresh': joblib.load('models/closure_best_threshold.pkl')
+        'global_medians':    joblib.load('models/global_medians.pkl'),
+        'closure_best_thresh': joblib.load('models/closure_best_threshold.pkl'),
+        'preprocessor':      joblib.load('models/preprocessor.pkl'),            # IQR bounds + mode values + time_dummies
+        'eval_metrics':      json.load(open('models/eval_metrics.json')),
     }
 
 # Safe model load
@@ -164,7 +168,7 @@ except Exception as e:
 # ─── Recommendation Engine ─────────────────────────────────────
 def generate_recommendations(priority_prob: float, closure_prob: float, 
                                duration_est: float, event_cause: str,
-                               hour: int, zone: str) -> dict:
+                               hour: int, zone: str, closure_thresh: float = 0.396) -> dict:
     """
     Rule-based recommendation layer on top of ML predictions.
     Returns manpower, barricading level, and diversion urgency.
@@ -178,18 +182,18 @@ def generate_recommendations(priority_prob: float, closure_prob: float,
         manpower = "LOW — 2 officers sufficient"
 
     # Barricading
-    if closure_prob >= 0.60:
+    if closure_prob >= closure_thresh:
         barricading = "FULL ROAD CLOSURE — Deploy heavy barricades, signage, and rerouting boards"
-    elif closure_prob >= 0.30:
+    elif closure_prob >= closure_thresh * 0.5:
         barricading = "PARTIAL — Lane-level barricading recommended"
     else:
         barricading = "MINIMAL — Cones / soft barricades only"
 
     # Diversion
     is_peak = hour in [7,8,9,17,18,19,20]
-    if closure_prob >= 0.5 and is_peak:
+    if closure_prob >= closure_thresh and is_peak:
         diversion = "URGENT — Activate alternate route NOW. Notify Waze/Google Maps."
-    elif closure_prob >= 0.3 or duration_est > 90:
+    elif closure_prob >= closure_thresh * 0.75 or duration_est > 90:
         diversion = "RECOMMENDED — Pre-position route advisory boards"
     else:
         diversion = "MONITOR — No diversion needed currently"
@@ -319,8 +323,9 @@ if page == "🔮 Event Impact Predictor":
             zone_hour_event_count = global_medians['zone_hour_event_count']
 
         # Real lookup for corridor risk
-        if corridor in corridor_risk_lookup:
-            corridor_risk_score = corridor_risk_lookup[corridor].get('corridor_risk_score', global_medians['corridor_risk_score'])
+        corridor_key = corridor.strip().lower()
+        if corridor_key in corridor_risk_lookup:
+            corridor_risk_score = corridor_risk_lookup[corridor_key].get('corridor_risk_score', global_medians['corridor_risk_score'])
         else:
             corridor_risk_score = global_medians['corridor_risk_score']
 
@@ -347,29 +352,38 @@ if page == "🔮 Event Impact Predictor":
             'corridor_risk_score': corridor_risk_score,
         }
 
-        # Add time_of_day dummies
-        for lab in ['morning','afternoon','evening','late_evening']:
-            input_dict[f'time_of_day_{lab}'] = int(str(tod) == lab)
+        # Add time_of_day OHE dummies using the exact column list saved at training time.
+        # This replaces a hardcoded ['morning','afternoon','evening','late_evening'] list
+        # that would silently break if bins or label order ever changed.
+        for dummy_col in models['preprocessor']['time_dummies']:
+            label = dummy_col.replace('time_of_day_', '')
+            input_dict[dummy_col] = int(str(tod) == label)
 
-        input_df = pd.DataFrame([input_dict])
-        
-        # Align columns with training features list
-        feat = models['features']
-        for c in feat:
-            if c not in input_df.columns:
-                input_df[c] = 0
-        input_df = input_df[feat]
+        input_df_base = pd.DataFrame([input_dict])
+
+        def align_features(base_df, feat_list):
+            """Align inference row to a specific feature list, zero-filling missing cols."""
+            df_aligned = base_df.copy()
+            for c in feat_list:
+                if c not in df_aligned.columns:
+                    df_aligned[c] = 0
+            return df_aligned[feat_list]
+
+        # Priority model uses FEATURES_PRIORITY (geo_high_priority_rate excluded)
+        input_df_priority = align_features(input_df_base, models['features_priority'])
+        # Closure + Duration models use FEATURES_ALL (geo_high_priority_rate included)
+        input_df_all      = align_features(input_df_base, models['features'])
 
         with st.spinner("Running ML models..."):
-            prio_prob = models['priority'].predict_proba(input_df)[0][1]
-            close_prob = models['closure'].predict_proba(input_df)[0][1]
+            prio_prob  = models['priority'].predict_proba(input_df_priority)[0][1]
+            close_prob = models['closure'].predict_proba(input_df_all)[0][1]
             try:
-                dur_log = models['duration'].predict(input_df)[0]
+                dur_log = models['duration'].predict(input_df_all)[0]
                 dur_est = np.expm1(dur_log)
             except Exception:
                 dur_est = 60.0
 
-        recs = generate_recommendations(prio_prob, close_prob, dur_est, event_cause, event_hour, zone)
+        recs = generate_recommendations(prio_prob, close_prob, dur_est, event_cause, event_hour, zone, closure_thresh=closure_best_thresh)
 
         # ─── Results Layout ───
         st.markdown("---")
@@ -575,57 +589,39 @@ elif page == "📋 Model Performance":
     st.title("📋 Model Performance & Validation Report")
     st.markdown("Post-training classification reports, regression stability scores, and predictor feature importance weights.")
 
+    metrics = models.get('eval_metrics', {})
+
     t1, t2, t3 = st.tabs(["⚡ Priority Model", "🚧 Road Closure Model", "⏱️ Duration Regressor"])
 
     with t1:
         st.subheader("Priority Classification (LightGBM)")
-        st.markdown("The Priority classifier was trained using target encoding and SMOTE over-sampling to handle minor priority imbalance. The final model achieves a Weighted F1 score of ~89%.")
-        
-        st.markdown("""
-        | Metric | Low Priority | High Priority | Weighted Avg |
-        |---|---|---|---|
-        | **Precision** | 0.87 | 0.91 | 0.89 |
-        | **Recall** | 0.89 | 0.88 | 0.89 |
-        | **F1-Score** | 0.88 | 0.90 | 0.89 |
-        | **ROC-AUC** | — | — | **0.9525** |
-        """)
+        st.markdown("The Priority classifier was trained using target encoding and SMOTE over-sampling. The model is tuned for macro-averaged F1 and general AUC robustness.")
+        m1, m2 = st.columns(2)
+        m1.metric("ROC-AUC", f"{metrics.get('priority_roc_auc', 'N/A')}")
+        m2.metric("Weighted F1", f"{metrics.get('priority_f1_weighted', 'N/A')}")
         
     with t2:
         st.subheader("Road Closure Classification (XGBoost)")
-        st.markdown("The Road Closure model handles severe class imbalance (~91% False vs ~9% True). SMOTE with scale_pos_weight is used, combined with threshold-tuning on validation predictions to maximize F1-score.")
-        
-        st.markdown("""
-        | Metric | No Closure | Closure | Weighted Avg |
-        |---|---|---|---|
-        | **Precision** | 0.98 | 0.72 | 0.96 |
-        | **Recall** | 0.99 | 0.60 | 0.97 |
-        | **F1-Score** | 0.98 | 0.65 | 0.96 |
-        | **ROC-AUC** | — | — | **0.9341** |
-        """)
+        st.markdown("The Road Closure model handles severe class imbalance. SMOTE is used, combined with threshold-tuning on validation predictions to maximize F1-score.")
+        m1, m2 = st.columns(2)
+        m1.metric("ROC-AUC", f"{metrics.get('closure_roc_auc', 'N/A')}")
+        m2.metric("Optimal Validation Threshold", f"{metrics.get('closure_best_threshold', 'N/A')}")
         
     with t3:
         st.subheader("Duration Regression (LightGBM)")
-        st.markdown("The Duration Regressor predicts the elapsed time of a congestion incident in minutes. It is trained only on records containing a valid end time (~3,000 samples). A log-transformation log1p target scale is used for stability.")
-        
-        st.markdown("""
-        | Metric | Value |
-        |---|---|
-        | **Mean Absolute Error (MAE)** | ~28.4 minutes |
-        | **R² Score** | **0.6214** |
-        """)
-        st.caption("ℹ️ *Note: The target duration contains high missing values (94%) in ASTRAM, which explains the moderate size of the regression subset.*")
+        st.markdown("The Duration Regressor predicts the elapsed time of a congestion incident in minutes. It is trained only on records containing a valid end time.")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Mean Absolute Error", f"{metrics.get('duration_mae', 'N/A')} min")
+        m2.metric("Median Absolute Error", f"{metrics.get('duration_medae', 'N/A')} min")
+        m3.metric("R² Score (Original Scale)", f"{metrics.get('duration_r2', 'N/A')}")
+        st.caption("ℹ️ *Note: The target duration contains high missing values in ASTRAM. The predictions are evaluated on back-transformed original values (minutes).*")
 
     # Feature Importance Chart
     st.subheader("📈 Top Predictor Features (Feature Importance)")
-    fi_data = {
-        'Feature': ['geo_high_priority_rate', 'event_cause', 'corridor_risk_score',
-                    'zone_hour_event_count', 'hour', 'is_peak_hour', 'zone',
-                    'geo_closure_rate', 'is_planned', 'latitude'],
-        'Importance': [0.184, 0.152, 0.121, 0.103, 0.091, 0.082, 0.071, 0.063, 0.051, 0.042]
-    }
-    df_fi = pd.DataFrame(fi_data).sort_values('Importance', ascending=True)
-    fig_fi = px.bar(df_fi, x='Importance', y='Feature',
-                    orientation='h', color='Importance',
+    fi_records = metrics.get('priority_feature_importance', [])
+    df_fi = pd.DataFrame(fi_records).sort_values('importance', ascending=True)
+    fig_fi = px.bar(df_fi, x='importance', y='feature',
+                    orientation='h', color='importance',
                     color_continuous_scale='Reds', title="LightGBM Feature Importance (Top 10)")
     fig_fi.update_layout(paper_bgcolor='rgba(0,0,0,0)', font={'color': 'white', 'family': 'Outfit'})
     st.plotly_chart(fig_fi, use_container_width=True)
