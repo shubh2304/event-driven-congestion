@@ -8,6 +8,7 @@ import joblib
 from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, mean_absolute_error, r2_score, precision_recall_curve
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier, LGBMRegressor
@@ -68,6 +69,67 @@ except ImportError:
                     bit = 0
                     ch = 0
             return "".join(geohash)
+
+# ─── PREPROCESSING TRANSFORMERS ─────────────────────────────────────────────
+# Sklearn-compatible transformers fitted exclusively on df_train (after the
+# primary split in Step 6.5).  Their fitted values are bundled into
+# models/preprocessor.pkl so app.py applies the EXACT same transforms at
+# inference without any re-computation or hardcoded fallback logic.
+
+class IQRDurationCapper(BaseEstimator, TransformerMixin):
+    """Soft-caps duration_minutes using IQR bounds derived from training data.
+
+    fit():      computes Q1, Q3 from df_train[col] (non-null only) and stores
+                lower_ = Q1 - factor*IQR  and  upper_ = Q3 + factor*IQR.
+    transform(): clips values to [lower_, upper_] — no rows are dropped.
+    """
+    def __init__(self, col='duration_minutes', factor=1.5):
+        self.col    = col
+        self.factor = factor
+
+    def fit(self, df, y=None):
+        dur  = df[self.col].dropna()
+        q1, q3       = float(dur.quantile(0.25)), float(dur.quantile(0.75))
+        iqr          = q3 - q1
+        self.lower_  = q1 - self.factor * iqr
+        self.upper_  = q3 + self.factor * iqr
+        return self
+
+    def transform(self, df, y=None):
+        df   = df.copy()
+        mask = df[self.col].notna()
+        df.loc[mask, self.col] = df.loc[mask, self.col].clip(self.lower_, self.upper_)
+        return df
+
+
+class CategoricalImputer(BaseEstimator, TransformerMixin):
+    """Fills NaN in categorical columns using mode values from training data.
+
+    mode_cols:   list of column names whose mode is computed at fit() time.
+    fixed_fills: {col: constant} applied regardless of training distribution
+                 (e.g. junction → 'unknown_junction').
+    """
+    def __init__(self, mode_cols=None, fixed_fills=None):
+        self.mode_cols   = mode_cols   or []
+        self.fixed_fills = fixed_fills or {}
+
+    def fit(self, df, y=None):
+        self.mode_values_ = {}
+        for col in self.mode_cols:
+            if col in df.columns and not df[col].isna().all():
+                self.mode_values_[col] = df[col].mode()[0]
+        return self
+
+    def transform(self, df, y=None):
+        df = df.copy()
+        for col, val in self.mode_values_.items():
+            if col in df.columns:
+                df[col] = df[col].fillna(val)
+        for col, val in self.fixed_fills.items():
+            if col in df.columns:
+                df[col] = df[col].fillna(val)
+        return df
+
 
 # ─── STEP 1: DATA LOADING & INITIAL CLEANING ──────────────────
 csv_filename = "Astram_event_data_anonymized.csv"
@@ -136,74 +198,49 @@ df['time_of_day'] = pd.cut(df['hour'],
 )
 print("Datetime feature engineering completed.")
 
-# ─── STEP 3: GEOSPATIAL FEATURE ENGINEERING ───────────────────
+# ─── STEP 3: GEOHASH ENCODING ONLY ───────────────────────────
+# NOTE: Geo aggregations (geo_stats, zone_hour_counts, corridor_risk) are
+# intentionally deferred to Step 6.6, which runs AFTER the primary
+# train/test split. Computing them here — on the full df — would leak
+# test-set labels into training features (e.g. geo_high_priority_rate would
+# include each row's own priority label in its own geohash aggregate).
 df['geohash6'] = df.apply(
     lambda r: encode_geohash(r['latitude'], r['longitude'], precision=6)
     if pd.notna(r['latitude']) and pd.notna(r['longitude']) else None, axis=1
 )
+print("Geohash encoding completed. Geo aggregations deferred until after train/test split.")
 
-# Location-level historical statistics
-geo_stats = df.groupby('geohash6').agg(
-    geo_event_count=('event_cause', 'count'),
-    geo_high_priority_rate=('priority', lambda x: (x=='High').mean()),
-    geo_closure_rate=('requires_road_closure', 'mean'),
-    geo_avg_duration=('duration_minutes', 'mean')
-).reset_index()
-df = df.merge(geo_stats, on='geohash6', how='left')
-
-# Zone × hour interaction count (congestion pressure index)
-zone_hour_counts = df.groupby(['zone', 'hour']).size().reset_index(name='zone_hour_event_count')
-df = df.merge(zone_hour_counts, on=['zone', 'hour'], how='left')
-
-# Corridor risk score (frequency-weighted)
-corridor_risk = df.groupby('corridor')['priority'].apply(lambda x: (x=='High').mean()).reset_index()
-corridor_risk.columns = ['corridor', 'corridor_risk_score']
-df = df.merge(corridor_risk, on='corridor', how='left')
-print("Geospatial feature engineering completed.")
-
-# ─── STEP 4: OUTLIER REMOVAL ──────────────────────────────────
-# Lat/lon — Bengaluru bounds (remove GPS errors)
+# ─── STEP 4: LAT/LON FILTERING ──────────────────────────────────────────────
+# Remove GPS errors that fall outside Bengaluru city bounds.
+# IQR soft-capping of duration_minutes is intentionally deferred to Step 6.7
+# where IQRDurationCapper is fitted on df_train only and saved to
+# models/preprocessor.pkl — ensuring (a) no test-set leakage in the bounds
+# and (b) consistent capping at inference time.
 df = df[
     df['latitude'].between(12.75, 13.30) &
     df['longitude'].between(77.25, 77.85)
 ]
+print("Lat/lon bounds filtering completed.")
 
-# Duration outliers — IQR method (only on non-null rows)
-dur_df = df[df['duration_minutes'].notna()]
-Q1, Q3 = dur_df['duration_minutes'].quantile([0.25, 0.75])
-IQR = Q3 - Q1
-lower, upper = Q1 - 1.5 * IQR, Q3 + 1.5 * IQR
-
-# Soft cap: replace extreme outliers with median, don't drop (preserves sample size)
-median_dur = dur_df['duration_minutes'].median()
-df.loc[df['duration_minutes'] < lower, 'duration_minutes'] = lower
-df.loc[df['duration_minutes'] > upper, 'duration_minutes'] = upper
-print("Outlier soft capping completed.")
-
-# ─── STEP 5: MISSING VALUE IMPUTATION ─────────────────────────
-# Categorical: mode imputation for low-missing; 'unknown' for high-missing
-cat_cols_mode = ['event_cause', 'veh_type', 'zone', 'corridor', 'police_station']
-for col in cat_cols_mode:
-    if col in df.columns:
-        df[col] = df[col].fillna(df[col].mode()[0])
-
+# ─── STEP 5: PRE-SPLIT MINIMAL IMPUTATION ───────────────────────────────────
+# Only deterministic, non-learnable fills are applied here (before the split).
+# Mode/median-based categorical imputation is deferred to Step 6.7 where
+# CategoricalImputer is fitted on df_train only — no full-dataset statistics
+# contaminate the imputed values used during training.
+#
+# junction: always fill with a known constant (no meaningful mode exists)
 df['junction'] = df['junction'].fillna('unknown_junction')
-
-# Impute temporal features if start_datetime was invalid
-df['hour'] = df['hour'].fillna(df['hour'].median() if not df['hour'].isna().all() else 12)
-df['day_of_week'] = df['day_of_week'].fillna(df['day_of_week'].mode()[0] if not df['day_of_week'].isna().all() else 0)
-df['month'] = df['month'].fillna(df['month'].mode()[0] if not df['month'].isna().all() else 1)
-df['is_weekend'] = df['is_weekend'].fillna(0)
+# Temporal features: safe neutral defaults for the rare edge case where
+# start_datetime is entirely missing (affects ~0 rows in practice)
+df['hour']        = df['hour'].fillna(12)       # noon — neutral time-of-day default
+df['day_of_week'] = df['day_of_week'].fillna(0) # Monday — neutral weekday default
+df['month']       = df['month'].fillna(1)        # January — neutral month default
+df['is_weekend']  = df['is_weekend'].fillna(0)
 df['is_peak_hour'] = df['is_peak_hour'].fillna(0)
+# Geo-aggregate columns are not yet present — NaN fill handled in Step 6.7.
+print("Pre-split imputation completed.")
 
-# Numeric: median imputation
-for col in ['geo_event_count', 'geo_high_priority_rate', 'geo_closure_rate',
-            'geo_avg_duration', 'zone_hour_event_count', 'corridor_risk_score']:
-    if col in df.columns:
-        df[col] = df[col].fillna(df[col].median())
-print("Missing value imputation completed.")
-
-# ─── STEP 6: ENCODING & FEATURE SELECTION ─────────────────────
+# ─── STEP 6: BASE ENCODING ────────────────────────────────────
 # Binary targets
 df['priority_binary'] = (df['priority'] == 'High').astype(int)
 df['road_closure_binary'] = df['requires_road_closure'].astype(int)
@@ -211,34 +248,165 @@ df['road_closure_binary'] = df['requires_road_closure'].astype(int)
 # Event type
 df['is_planned'] = (df['event_type'] == 'planned').astype(int)
 
-# Low-cardinality: One-Hot
+# Low-cardinality: One-Hot (applied to full df so all categories are seen)
 df = pd.get_dummies(df, columns=['time_of_day'], drop_first=True)
 
-# Final feature set
-FEATURES = [
+target_enc_cols = ['event_cause', 'veh_type', 'corridor', 'police_station', 'zone', 'junction']
+print("Base encoding completed.")
+
+# ─── STEP 6.5: PRIMARY TRAIN / TEST SPLIT ─────────────────────
+# This split MUST happen before any target-aware geo aggregations.
+# All three model evaluations (7A, 7B, 7C) share this same split for
+# consistent and fair comparison.
+print("\n--- Step 6.5: Primary Train/Test Split (pre-aggregation) ---")
+df_train, df_test = train_test_split(
+    df, test_size=0.2, stratify=df['priority_binary'], random_state=42
+)
+df_train = df_train.copy().reset_index(drop=True)
+df_test  = df_test.copy().reset_index(drop=True)
+print(f"Train: {len(df_train)} rows | Test: {len(df_test)} rows")
+
+# ─── STEP 6.6: GEO AGGREGATIONS ON TRAINING DATA ONLY ─────────
+# All target-aware aggregations are computed exclusively from df_train.
+# df_test rows look up their values from these training-derived tables;
+# unseen geohashes / corridors fall back to training medians.
+print("\n--- Step 6.6: Geospatial Aggregations (train-only) ---")
+
+geo_stats = df_train.groupby('geohash6').agg(
+    geo_event_count=('event_cause', 'count'),
+    geo_high_priority_rate=('priority', lambda x: (x == 'High').mean()),
+    geo_closure_rate=('requires_road_closure', 'mean'),
+    geo_avg_duration=('duration_minutes', 'mean')
+).reset_index()
+
+zone_hour_counts = df_train.groupby(['zone', 'hour']).size().reset_index(name='zone_hour_event_count')
+
+corridor_risk = df_train.groupby('corridor')['priority'].apply(
+    lambda x: (x == 'High').mean()
+).reset_index()
+corridor_risk.columns = ['corridor', 'corridor_risk_score']
+corridor_risk['corridor'] = corridor_risk['corridor'].str.strip().str.lower()
+df_train['corridor'] = df_train['corridor'].str.strip().str.lower()
+df_test['corridor']  = df_test['corridor'].str.strip().str.lower()
+
+# Merge onto train (all match) and test (unseen geohashes → NaN → filled below)
+df_train = df_train.merge(geo_stats,        on='geohash6',         how='left')
+df_test  = df_test.merge(geo_stats,         on='geohash6',         how='left')
+df_train = df_train.merge(zone_hour_counts, on=['zone', 'hour'],   how='left')
+df_test  = df_test.merge(zone_hour_counts,  on=['zone', 'hour'],   how='left')
+df_train = df_train.merge(corridor_risk,    on='corridor',         how='left')
+df_test  = df_test.merge(corridor_risk,     on='corridor',         how='left')
+
+# Fallback medians computed from TRAIN ONLY — saved for app.py inference
+geo_train_medians = {
+    'geo_event_count':        float(df_train['geo_event_count'].median()),
+    'geo_high_priority_rate': float(df_train['geo_high_priority_rate'].median()),
+    'geo_closure_rate':       float(df_train['geo_closure_rate'].median()),
+    'geo_avg_duration':       float(df_train['geo_avg_duration'].median()),
+    'zone_hour_event_count':  float(df_train['zone_hour_event_count'].median()),
+    'corridor_risk_score':    float(df_train['corridor_risk_score'].median()),
+}
+for col, med_val in geo_train_medians.items():
+    df_train[col] = df_train[col].fillna(med_val)
+    df_test[col]  = df_test[col].fillna(med_val)
+print("Geospatial aggregations complete. Train medians saved for inference fallback.")
+
+# ─── STEP 6.7: FIT PREPROCESSING TRANSFORMERS ON TRAINING DATA ───────────────
+# Replaces the old bare-Pandas IQR capping (was Step 4) and mode imputation
+# (was Step 5) that were both computed on the full df before the split.
+# These sklearn transformers are fitted on df_train only → no test-set
+# contamination of capping bounds or mode-imputation values.
+print("\n--- Step 6.7: Fitting Preprocessing Transformers (train-only) ---")
+
+iqr_capper = IQRDurationCapper(col='duration_minutes', factor=1.5)
+iqr_capper.fit(df_train)
+print(f"IQRDurationCapper: lower={iqr_capper.lower_:.1f} min | upper={iqr_capper.upper_:.1f} min")
+
+cat_imputer = CategoricalImputer(
+    mode_cols=['event_cause', 'veh_type', 'zone', 'corridor', 'police_station'],
+    fixed_fills={'junction': 'unknown_junction'}
+)
+cat_imputer.fit(df_train)
+print(f"CategoricalImputer modes (train-only): {cat_imputer.mode_values_}")
+
+df_train = iqr_capper.transform(df_train)
+df_test  = iqr_capper.transform(df_test)    # same training bounds applied to test — no leakage
+df_train = cat_imputer.transform(df_train)
+df_test  = cat_imputer.transform(df_test)   # same training modes applied to test — no leakage
+print("Preprocessing transformers applied to train and test splits.")
+
+# ─── FEATURE LISTS ─────────────────────────────────────────────
+# Exclusions from FEATURES_PRIORITY:
+#   geo_high_priority_rate  — smoothed copy of the priority target label
+#   corridor                — data investigation showed this IS the priority rule:
+#                             Non-corridor → 100% Low (3,120/3,120)
+#                             Named corridor → 99.6% High (5,029/5,048)
+#   corridor_risk_score     — derived from corridor, encodes the same rule as a float
+# Both corridor features are kept in FEATURES_ALL where they are legitimate
+# predictors for the closure and duration models (different targets).
+TIME_DUMMIES = sorted([c for c in df_train.columns if c.startswith('time_of_day_')])
+
+FEATURES_PRIORITY = [
+    'is_planned', 'hour', 'day_of_week', 'month', 'is_weekend', 'is_peak_hour',
+    'latitude', 'longitude',
+    'geo_event_count', 'geo_closure_rate', 'geo_avg_duration',
+    'zone_hour_event_count',
+    # corridor and corridor_risk_score excluded — they are the labeling rule, not a feature
+    # geo_high_priority_rate excluded — smoothed copy of the priority target
+    'event_cause', 'veh_type', 'police_station', 'zone', 'junction'
+] + TIME_DUMMIES
+
+# TargetEncoder for priority model must only reference columns that are IN FEATURES_PRIORITY
+# (corridor is excluded, so it must be removed from the encoder's cols list too)
+target_enc_cols_priority = [c for c in target_enc_cols if c in FEATURES_PRIORITY]
+
+FEATURES_ALL = [
     'is_planned', 'hour', 'day_of_week', 'month', 'is_weekend', 'is_peak_hour',
     'latitude', 'longitude',
     'geo_event_count', 'geo_high_priority_rate', 'geo_closure_rate', 'geo_avg_duration',
     'zone_hour_event_count', 'corridor_risk_score',
     'event_cause', 'veh_type', 'corridor', 'police_station', 'zone', 'junction'
-] + [c for c in df.columns if c.startswith('time_of_day_')]
+] + TIME_DUMMIES
 
-target_enc_cols = ['event_cause', 'veh_type', 'corridor', 'police_station', 'zone', 'junction']
+print(f"FEATURES_PRIORITY: {len(FEATURES_PRIORITY)} features "
+      f"(corridor, corridor_risk_score, geo_high_priority_rate all excluded)")
+print(f"FEATURES_ALL:      {len(FEATURES_ALL)} features (used for closure + duration models)")
+print(f"target_enc_cols_priority: {target_enc_cols_priority}")
 
-print(f"Features list prepared ({len(FEATURES)} features). Target encoding columns defined.")
+# ─── PREPROCESSING STATE ─────────────────────────────────────────────────────
+# Bundles fitted transform values as plain Python types (no class objects) so
+# models/preprocessor.pkl deserialises cleanly in app.py without needing the
+# IQRDurationCapper / CategoricalImputer class definitions to be present.
+preprocessor_state = {
+    'time_dummies': TIME_DUMMIES,              # exact OHE column names: ['time_of_day_afternoon', ...]
+    'iqr_lower':    float(iqr_capper.lower_),  # min duration allowed at inference
+    'iqr_upper':    float(iqr_capper.upper_),  # max duration allowed at inference
+    'mode_values':  dict(cat_imputer.mode_values_),   # categorical NaN fill values
+}
+print(f"Preprocessing state: time_dummies={TIME_DUMMIES}")
+print(f"                     iqr=[{iqr_capper.lower_:.1f}, {iqr_capper.upper_:.1f}] min")
+print(f"                     mode_values={cat_imputer.mode_values_}")
 
-# ─── STEP 7: ML MODEL PIPELINE ────────────────────────────────
-X = df[FEATURES].copy()
+# ─── STEP 7: ML MODEL PIPELINES ───────────────────────────────
+# df_train / df_test were defined in Step 6.5. All three models use this
+# single, consistent split — no per-model train_test_split calls below.
 
-# Ensure binary categories are converted to numeric boolean values if any, and dummy cols to int
-for c in X.columns:
-    if X[c].dtype == bool:
-        X[c] = X[c].astype(int)
+def prep_X(df_subset, feature_list):
+    """Extract and type-cast a feature matrix from a dataframe subset."""
+    X = df_subset[feature_list].copy()
+    for c in X.columns:
+        if X[c].dtype == bool:
+            X[c] = X[c].astype(int)
+    return X
 
 # 7A. Classification — Priority Prediction (High / Low)
-y_priority = df['priority_binary']
-
+# Uses FEATURES_PRIORITY which excludes geo_high_priority_rate.
 print("\n--- 7A. Priority Classification cross-validation ---")
+X_train_p = prep_X(df_train, FEATURES_PRIORITY)
+X_test_p  = prep_X(df_test,  FEATURES_PRIORITY)
+y_train_p = df_train['priority_binary']
+y_test_p  = df_test['priority_binary']
+
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
 models_cv = {
@@ -251,87 +419,118 @@ models_cv = {
                                            class_weight='balanced', random_state=42),
 }
 
+lgbm_f1_cv = 0.0
 for name, model in models_cv.items():
     pipe = ImbPipeline([
-        ('te', ce.TargetEncoder(cols=target_enc_cols, smoothing=5)),
+        ('te', ce.TargetEncoder(cols=target_enc_cols_priority, smoothing=5)),
         ('smote', SMOTE(random_state=42)),
         ('clf', model)
     ])
-    scores = cross_val_score(pipe, X, y_priority, cv=skf, scoring='f1_weighted')
+    scores = cross_val_score(pipe, X_train_p, y_train_p, cv=skf, scoring='f1_weighted')
+    if name == 'LightGBM':
+        lgbm_f1_cv = scores.mean()
     print(f"{name}: Weighted F1 = {scores.mean():.4f} ± {scores.std():.4f}")
-
-# Train final LightGBM Priority model
-X_train, X_test, y_train, y_test = train_test_split(X, y_priority, 
-    test_size=0.2, stratify=y_priority, random_state=42)
 
 print("\nTraining final Priority model (LightGBM)...")
 final_pipe_priority = ImbPipeline([
-    ('te', ce.TargetEncoder(cols=target_enc_cols, smoothing=5)),
+    ('te', ce.TargetEncoder(cols=target_enc_cols_priority, smoothing=5)),
     ('smote', SMOTE(random_state=42)),
     ('clf', LGBMClassifier(n_estimators=500, learning_rate=0.03, num_leaves=63, random_state=42, verbose=-1))
 ])
-final_pipe_priority.fit(X_train, y_train)
-y_pred = final_pipe_priority.predict(X_test)
-y_prob = final_pipe_priority.predict_proba(X_test)[:, 1]
+final_pipe_priority.fit(X_train_p, y_train_p)
+y_pred = final_pipe_priority.predict(X_test_p)
+y_prob = final_pipe_priority.predict_proba(X_test_p)[:, 1]
 
 print("Priority Model Evaluation Report:")
-print(classification_report(y_test, y_pred, target_names=['Low', 'High']))
-print(f"Priority ROC-AUC: {roc_auc_score(y_test, y_prob):.4f}")
+print(classification_report(y_test_p, y_pred, target_names=['Low', 'High']))
+print(f"Priority ROC-AUC: {roc_auc_score(y_test_p, y_prob):.4f}")
+
+lgbm_model = final_pipe_priority.named_steps['clf']
+te_step = final_pipe_priority.named_steps['te']
+feature_names = models['features_priority'] if 'models' in dir() else FEATURES_PRIORITY
+fi_scores = lgbm_model.feature_importances_
+fi_df = pd.DataFrame({'feature': FEATURES_PRIORITY, 'importance': fi_scores})
+fi_df = fi_df.sort_values('importance', ascending=False).head(10)
+priority_feature_importance = fi_df.to_dict(orient='records')
 
 
 # 7B. Classification — Road Closure Prediction
+# Uses FEATURES_ALL (includes geo_high_priority_rate as a legitimate historical signal).
+# Fix 5: threshold is tuned on df_val_c (a held-out 20% slice of df_train), NOT on
+# df_test. Previously, precision_recall_curve(y_te, probs_c) searched for the optimal
+# threshold using the same test labels it then reported F1 on — a circular evaluation
+# that produced an optimistically biased threshold (e.g. 0.287).
 print("\n--- 7B. Road Closure Classification ---")
-y_closure = df['road_closure_binary']
+
+# Carve out a 20% validation split from df_train (stratified on closure label).
+# df_test is kept completely blind until the final evaluation print below.
+df_tr_c, df_val_c = train_test_split(
+    df_train, test_size=0.2, stratify=df_train['road_closure_binary'], random_state=42
+)
+X_tr  = prep_X(df_tr_c,  FEATURES_ALL)   # model is fit on this
+X_val = prep_X(df_val_c, FEATURES_ALL)   # threshold is tuned on this
+X_te  = prep_X(df_test,  FEATURES_ALL)   # metrics are reported on this (never touched before)
+y_tr  = df_tr_c['road_closure_binary']
+y_val = df_val_c['road_closure_binary']
+y_te  = df_test['road_closure_binary']
 
 final_pipe_closure = ImbPipeline([
     ('te', ce.TargetEncoder(cols=target_enc_cols, smoothing=5)),
-    ('smote', SMOTE(random_state=42, sampling_strategy=0.4)),  # don't oversample to 1:1
+    ('smote', SMOTE(random_state=42, sampling_strategy=0.4)),  # brings minority from 8.2% → ~29%
     ('clf', XGBClassifier(n_estimators=400, max_depth=5, learning_rate=0.05,
-                          scale_pos_weight=11,   # 7497/676
+                          # scale_pos_weight REMOVED (Fix 4): SMOTE already rebalances the
+                          # training distribution; keeping both double-weights the minority class.
                           random_state=42, eval_metric='logloss'))
 ])
-
-X_tr, X_te, y_tr, y_te = train_test_split(X, y_closure, 
-    test_size=0.2, stratify=y_closure, random_state=42)
 final_pipe_closure.fit(X_tr, y_tr)
-probs_c = final_pipe_closure.predict_proba(X_te)[:, 1]
 
-# Threshold tuning
-precisions, recalls, thresholds = precision_recall_curve(y_te, probs_c)
-# Align shapes correctly (precisions and recalls have an extra value at index -1)
-f1_scores = 2 * precisions[:-1] * recalls[:-1] / (precisions[:-1] + recalls[:-1] + 1e-8)
-best_thresh = thresholds[np.argmax(f1_scores)]
+# ── Threshold tuning on VALIDATION set (never seen during fit) ────────────────
+probs_val = final_pipe_closure.predict_proba(X_val)[:, 1]
+precisions_v, recalls_v, thresholds_v = precision_recall_curve(y_val, probs_val)
+f1_scores_v = (2 * precisions_v[:-1] * recalls_v[:-1]
+               / (precisions_v[:-1] + recalls_v[:-1] + 1e-8))
+best_thresh = float(thresholds_v[np.argmax(f1_scores_v)])
+
+# ── Final evaluation on TEST set using the validation-derived threshold ────────
+probs_c = final_pipe_closure.predict_proba(X_te)[:, 1]
 y_pred_tuned = (probs_c >= best_thresh).astype(int)
 
-print(f"Tuned Threshold: {best_thresh:.3f}")
+print(f"Tuned Threshold (val-derived): {best_thresh:.3f}")
 print("Road Closure Model Evaluation Report (Tuned):")
 print(classification_report(y_te, y_pred_tuned, target_names=['No Closure', 'Closure']))
 print(f"Road Closure ROC-AUC: {roc_auc_score(y_te, probs_c):.4f}")
 
 
 # 7C. Regression — Duration Prediction (minutes)
+# Uses FEATURES_ALL. Only rows with a known duration are included.
 print("\n--- 7C. Duration Regression ---")
-# Use only rows with known duration
-dur_mask = df['duration_minutes'].notna()
-X_dur = df.loc[dur_mask, FEATURES].copy()
-y_dur = np.log1p(df.loc[dur_mask, 'duration_minutes'])  # log-transform for skew
-
-X_tr_d, X_te_d, y_tr_d, y_te_d = train_test_split(X_dur, y_dur,
-    test_size=0.2, random_state=42)
+dur_mask_tr = df_train['duration_minutes'].notna()
+dur_mask_te = df_test['duration_minutes'].notna()
+X_tr_d = prep_X(df_train.loc[dur_mask_tr], FEATURES_ALL)
+X_te_d = prep_X(df_test.loc[dur_mask_te],  FEATURES_ALL)
+y_tr_d = np.log1p(df_train.loc[dur_mask_tr, 'duration_minutes'])
+y_te_d = np.log1p(df_test.loc[dur_mask_te,  'duration_minutes'])
 
 dur_pipe = SkPipeline([
-    ('te', ce.TargetEncoder(cols=[c for c in target_enc_cols if c in X_dur.columns], smoothing=5)),
+    ('te', ce.TargetEncoder(cols=[c for c in target_enc_cols if c in X_tr_d.columns], smoothing=5)),
     ('reg', LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=63, random_state=42, verbose=-1))
 ])
 dur_pipe.fit(X_tr_d, y_tr_d)
 y_pred_d = dur_pipe.predict(X_te_d)
 
-# Back-transform
-y_te_d_exp = np.expm1(y_te_d)
-y_pred_d_exp = np.expm1(y_pred_d)
-mae = mean_absolute_error(y_te_d_exp, y_pred_d_exp)
-r2 = r2_score(y_te_d, y_pred_d)
-print(f"Duration Regression MAE: {mae:.2f} minutes | R²: {r2:.4f}")
+# All metrics are computed on the ORIGINAL scale (minutes) by back-transforming
+# via expm1(). Previously r2_score used the raw log-space arrays (y_te_d / y_pred_d)
+# which made R² uninterpretable — a negative R² looked like "no skill" but was just
+# an artefact of the log-scale residual geometry.
+y_te_d_exp   = np.expm1(y_te_d)     # actual durations in minutes
+y_pred_d_exp = np.expm1(y_pred_d)   # predicted durations in minutes
+
+mae    = mean_absolute_error(y_te_d_exp, y_pred_d_exp)          # mean absolute error (minutes)
+medae  = float(np.median(np.abs(y_te_d_exp - y_pred_d_exp)))    # median AE — robust to skew
+r2     = r2_score(y_te_d_exp, y_pred_d_exp)                     # R² on original scale ← Fix 6
+r2_log = r2_score(y_te_d,     y_pred_d)                         # log-space R² kept for reference
+print(f"Duration Regression (original scale):")
+print(f"  MAE={mae:.1f} min | MedAE={medae:.1f} min | R²={r2:.4f}  (log-space R²={r2_log:.4f})")
 
 
 # ─── STEP 8: DBSCAN HOTSPOT CLUSTERING ────────────────────────
@@ -361,37 +560,45 @@ cluster_profile = df_cluster[df_cluster['cluster'] >= 0].groupby('cluster').agg(
 ).reset_index()
 
 
-# ─── STEP 9: RECOMMENDATION ENGINE (Defined in app.py) ────────
-# Setup lookup tables for production lookup in the Streamlit app
+# ─── STEP 9: PRODUCTION LOOKUP TABLES ────────────────────────
+# geo_stats, zone_hour_counts, and corridor_risk were all computed on
+# df_train in Step 6.6 — they are safe to expose as production lookups.
 print("\n--- Step 9: Creating Production Lookups for Dashboard ---")
-# 1. geohash6 stats lookup table
-geohash_lookup = geo_stats.set_index('geohash6').to_dict(orient='index')
-# 2. zone x hour stats lookup table
-zone_hour_lookup = zone_hour_counts.set_index(['zone', 'hour']).to_dict(orient='index')
-# 3. corridor risk stats lookup table
+geohash_lookup     = geo_stats.set_index('geohash6').to_dict(orient='index')
+zone_hour_lookup   = zone_hour_counts.set_index(['zone', 'hour']).to_dict(orient='index')
 corridor_risk_lookup = corridor_risk.set_index('corridor').to_dict(orient='index')
 
-# Calculate global medians for fallback
-global_medians = {
-    'geo_event_count': float(df['geo_event_count'].median()),
-    'geo_high_priority_rate': float(df['geo_high_priority_rate'].median()),
-    'geo_closure_rate': float(df['geo_closure_rate'].median()),
-    'geo_avg_duration': float(df['geo_avg_duration'].median()),
-    'zone_hour_event_count': float(df['zone_hour_event_count'].median()),
-    'corridor_risk_score': float(df['corridor_risk_score'].median()),
-}
+# global_medians come from geo_train_medians (train-derived, computed in Step 6.6)
+global_medians = geo_train_medians
 
 
 # ─── STEP 10: MODEL PERSISTENCE ───────────────────────────────
 print("\n--- Step 10: Persisting Models & Metadata ---")
 os.makedirs('models', exist_ok=True)
+
+import json
+eval_metrics = {
+    "priority_roc_auc": round(float(roc_auc_score(y_test_p, y_prob)), 4),
+    "priority_f1_weighted": round(float(lgbm_f1_cv), 4),
+    "closure_roc_auc": round(float(roc_auc_score(y_te, probs_c)), 4),
+    "closure_best_threshold": round(float(best_thresh), 3),
+    "duration_mae": round(float(mae), 1),
+    "duration_medae": round(float(medae), 1),
+    "duration_r2": round(float(r2), 4),
+    "priority_feature_importance": priority_feature_importance
+}
+with open("models/eval_metrics.json", "w") as f:
+    json.dump(eval_metrics, f, indent=2)
+
 joblib.dump(final_pipe_priority, 'models/priority_classifier.pkl')
 joblib.dump(final_pipe_closure, 'models/closure_classifier.pkl')
 joblib.dump(dur_pipe, 'models/duration_regressor.pkl')
 joblib.dump(db, 'models/dbscan_clusterer.pkl')
 joblib.dump(cluster_profile, 'models/cluster_profiles.pkl')
 joblib.dump(df_cluster, 'models/cluster_points.pkl')
-joblib.dump(FEATURES, 'models/feature_list.pkl')
+joblib.dump(FEATURES_PRIORITY,    'models/feature_list_priority.pkl')  # priority model (no geo_high_priority_rate)
+joblib.dump(FEATURES_ALL,          'models/feature_list.pkl')            # closure + duration models
+joblib.dump(preprocessor_state,    'models/preprocessor.pkl')            # fitted IQR bounds + mode values + time_dummies
 
 # Dump lookups for Streamlit App
 joblib.dump(geohash_lookup, 'models/geohash_lookup.pkl')

@@ -1,0 +1,51 @@
+{
+  "priority_roc_auc": 0.9856,
+  "priority_f1_weighted": 0.9625,
+  "closure_roc_auc": 0.6811,
+  "closure_best_threshold": 0.396,
+  "duration_mae": 55.4,
+  "duration_medae": 32.3,
+  "duration_r2": 0.2209,
+  "priority_feature_importance": [
+    {
+      "feature": "longitude",
+      "importance": 6600
+    },
+    {
+      "feature": "latitude",
+      "importance": 6008
+    },
+    {
+      "feature": "geo_event_count",
+      "importance": 3107
+    },
+    {
+      "feature": "geo_avg_duration",
+      "importance": 2979
+    },
+    {
+      "feature": "police_station",
+      "importance": 2224
+    },
+    {
+      "feature": "geo_closure_rate",
+      "importance": 1755
+    },
+    {
+      "feature": "junction",
+      "importance": 1445
+    },
+    {
+      "feature": "hour",
+      "importance": 1240
+    },
+    {
+      "feature": "event_cause",
+      "importance": 1172
+    },
+    {
+      "feature": "day_of_week",
+      "importance": 1125
+    }
+  ]
+}
