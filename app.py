@@ -4,10 +4,17 @@ import numpy as np
 import joblib
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import warnings
 warnings.filterwarnings('ignore')
+
+# ─── Import Chatbot & Online Learning Modules ──────────────────
+from chatbot import parse_user_message, execute_intent
+from online_update import PredictionLogger, DriftDetector
+
+# Initialize prediction logger
+prediction_logger = PredictionLogger()
 
 # ─── GEOCONVERTER FALLBACK ────────────────────────────────────
 try:
@@ -218,7 +225,9 @@ page = st.sidebar.radio("Navigate", [
     "🔮 Event Impact Predictor",
     "🗺️ Hotspot Map",
     "📊 Dataset Analytics",
-    "📋 Model Performance"
+    "📋 Model Performance",
+    "💬 ASTRAM Assistant",
+    "📡 Model Monitoring"
 ])
 
 st.sidebar.markdown("---")
@@ -384,6 +393,14 @@ if page == "🔮 Event Impact Predictor":
                 dur_est = 60.0
 
         recs = generate_recommendations(prio_prob, close_prob, dur_est, event_cause, event_hour, zone, closure_thresh=closure_best_thresh)
+
+        # ─── Log Prediction ───
+        prediction_logger.log_prediction(
+            input_params=input_dict,
+            predictions={'priority_prob': prio_prob, 'closure_prob': close_prob,
+                         'duration_est': dur_est},
+            recommendations=recs
+        )
 
         # ─── Results Layout ───
         st.markdown("---")
@@ -625,3 +642,219 @@ elif page == "📋 Model Performance":
                     color_continuous_scale='Reds', title="LightGBM Feature Importance (Top 10)")
     fig_fi.update_layout(paper_bgcolor='rgba(0,0,0,0)', font={'color': 'white', 'family': 'Outfit'})
     st.plotly_chart(fig_fi, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PAGE 5 — CHATBOT ASSISTANT
+# ═══════════════════════════════════════════════════════════════
+elif page == "💬 ASTRAM Assistant":
+    st.title("💬 ASTRAM Traffic Assistant")
+    st.markdown(
+        "Ask questions in natural language to get predictions, explore hotspots, "
+        "compare corridors, and understand how the models work."
+    )
+
+    # Custom chat styling
+    st.markdown("""
+    <style>
+    .stChatMessage {
+        border-radius: 12px !important;
+        margin-bottom: 0.5rem !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # Initialize chat history
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    "👋 I'm the **ASTRAM Traffic Assistant**. I can help you:\n\n"
+                    "🔮 **Predict** — *\"accident at 12.97, 77.59 at 5pm\"*\n\n"
+                    "🗺️ **Hotspots** — *\"show hotspots in North Zone 1\"*\n\n"
+                    "⚖️ **Compare** — *\"compare Mysore Road vs Hosur Road\"*\n\n"
+                    "❓ **Explain** — *\"how are recommendations generated?\"*\n\n"
+                    "📊 **Metrics** — *\"model accuracy\"*\n\n"
+                    "Type your question below to get started! 👇"
+                )
+            }
+        ]
+
+    # Display chat history
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # Chat input
+    if prompt := st.chat_input("Ask about traffic events, hotspots, or predictions..."):
+        # Display user message
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Parse intent and generate response
+        with st.spinner("Thinking..."):
+            parsed = parse_user_message(prompt)
+            response = execute_intent(
+                parsed, models,
+                encode_geohash_fn=encode_geohash,
+                generate_recommendations_fn=generate_recommendations
+            )
+
+        # Display assistant response
+        st.session_state.chat_messages.append({"role": "assistant", "content": response})
+        with st.chat_message("assistant"):
+            st.markdown(response)
+
+    # Sidebar helper for chat
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**💡 Chat Quick Actions:**")
+    if st.sidebar.button("🔄 Clear Chat History"):
+        st.session_state.chat_messages = [st.session_state.chat_messages[0]]
+        st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════
+# PAGE 6 — MODEL MONITORING
+# ═══════════════════════════════════════════════════════════════
+elif page == "📡 Model Monitoring":
+    st.title("📡 Model Monitoring & Drift Detection")
+    st.markdown(
+        "Track prediction quality, detect data drift, and monitor model health over time."
+    )
+
+    # Load prediction logs
+    pred_logs = prediction_logger.get_all_predictions()
+
+    if pred_logs.empty:
+        st.info(
+            "📭 No prediction logs yet. Use the **🔮 Event Impact Predictor** or "
+            "**💬 ASTRAM Assistant** to generate predictions, and they'll appear here."
+        )
+    else:
+        # Overview metrics
+        st.subheader("📊 Prediction Volume")
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Total Predictions", f"{len(pred_logs):,}")
+
+        # Recent predictions (last 24h)
+        recent = prediction_logger.get_recent_predictions(hours=24)
+        mc2.metric("Last 24 Hours", f"{len(recent):,}")
+
+        # Average priority risk
+        prio_vals = pd.to_numeric(pred_logs['priority_prob'], errors='coerce').dropna()
+        if len(prio_vals) > 0:
+            mc3.metric("Avg Priority Risk", f"{prio_vals.mean()*100:.1f}%")
+
+        # Average closure risk
+        close_vals = pd.to_numeric(pred_logs['closure_prob'], errors='coerce').dropna()
+        if len(close_vals) > 0:
+            mc4.metric("Avg Closure Risk", f"{close_vals.mean()*100:.1f}%")
+
+        # Prediction distribution over time
+        st.subheader("📈 Prediction Distributions Over Time")
+
+        col_m1, col_m2 = st.columns(2)
+
+        with col_m1:
+            if len(prio_vals) > 0:
+                fig_prio_hist = px.histogram(
+                    x=prio_vals * 100,
+                    nbins=20,
+                    title="Priority Risk Distribution (%)",
+                    labels={'x': 'Priority Probability (%)'},
+                    color_discrete_sequence=['#ef4444']
+                )
+                fig_prio_hist.update_layout(
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    font={'color': 'white', 'family': 'Outfit'},
+                    showlegend=False
+                )
+                st.plotly_chart(fig_prio_hist, use_container_width=True)
+
+        with col_m2:
+            if len(close_vals) > 0:
+                fig_close_hist = px.histogram(
+                    x=close_vals * 100,
+                    nbins=20,
+                    title="Closure Risk Distribution (%)",
+                    labels={'x': 'Closure Probability (%)'},
+                    color_discrete_sequence=['#3b82f6']
+                )
+                fig_close_hist.update_layout(
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    font={'color': 'white', 'family': 'Outfit'},
+                    showlegend=False
+                )
+                st.plotly_chart(fig_close_hist, use_container_width=True)
+
+        # Drift detection
+        st.subheader("🔍 Drift Detection (PSI — Population Stability Index)")
+        st.markdown(
+            "PSI measures how much prediction distributions have shifted. "
+            "Values **< 0.10** are stable, **0.10–0.25** indicate moderate drift, "
+            "**> 0.25** suggests significant drift requiring retraining."
+        )
+
+        if len(pred_logs) >= 40:
+            detector = DriftDetector()
+            drift_results = detector.check_prediction_drift(pred_logs)
+
+            drift_rows = []
+            for col, info in drift_results.items():
+                if isinstance(info, dict) and 'psi' in info:
+                    drift_rows.append({
+                        'Metric': col.replace('_', ' ').title(),
+                        'PSI': info.get('psi', 'N/A'),
+                        'Status': info.get('status', 'Unknown')
+                    })
+
+            if drift_rows:
+                st.dataframe(
+                    pd.DataFrame(drift_rows),
+                    use_container_width=True,
+                    hide_index=True
+                )
+            else:
+                st.info("Drift analysis returned no results.")
+        else:
+            st.warning(
+                f"Need at least 40 predictions for drift detection. "
+                f"Current count: {len(pred_logs)}."
+            )
+
+        # Recent prediction log table
+        st.subheader("📋 Recent Prediction Log")
+        display_cols = ['timestamp', 'event_cause', 'zone', 'priority_prob',
+                        'closure_prob', 'duration_est_min']
+        available_cols = [c for c in display_cols if c in pred_logs.columns]
+        st.dataframe(
+            pred_logs[available_cols].tail(20).sort_values('timestamp', ascending=False),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Online learning status
+        st.subheader("🔄 Online Learning Status")
+        retrain_log_path = 'models/retrain_log.json'
+        if os.path.exists(retrain_log_path):
+            import json
+            with open(retrain_log_path, 'r') as f:
+                retrain_logs = json.load(f)
+            if retrain_logs:
+                last = retrain_logs[-1]
+                rc1, rc2, rc3 = st.columns(3)
+                rc1.metric("Last Retrain", last.get('timestamp', 'N/A')[:19])
+                rc2.metric("Status", last.get('status', 'N/A'))
+                rc3.metric("Data Rows", f"{last.get('data_rows', 'N/A'):,}"
+                           if isinstance(last.get('data_rows'), int) else 'N/A')
+        else:
+            st.info(
+                "No retraining has been performed yet. Run the incremental "
+                "retraining script:\n\n"
+                "```bash\npython online_update.py --retrain --window-months 6\n```"
+            )
+

@@ -1,0 +1,1 @@
+timestamp,latitude,longitude,hour,day_of_week,month,event_cause,zone,corridor,priority_prob,closure_prob,duration_est_min,manpower_level,barricading_level,diversion_level,actual_priority,actual_closure,actual_duration_min,feedback_correct

@@ -1,7 +1,7 @@
 # 🚦 Event-Driven Congestion Forecasting System — ASTRAM
 #SKMKB
 
-An end-to-end machine learning system and interactive dashboard for forecasting traffic congestion severity in Bengaluru. The system is trained on historical data to predict incident priority, identify road closure risks, forecast congestion durations, cluster active hotspot zones, and recommend field resources (manpower, barricades, and diversions).
+An end-to-end machine learning system and interactive dashboard for forecasting traffic congestion severity in Bengaluru. The system is trained on historical data to predict incident priority, identify road closure risks, forecast congestion durations, cluster active hotspot zones, and recommend field resources (manpower, barricades, and diversions). It also features a **conversational AI chatbot**, **online learning infrastructure** for incremental model updates, **drift detection**, and a **REST API** for external system integrations.
 
 ---
 
@@ -62,9 +62,43 @@ An end-to-end machine learning system and interactive dashboard for forecasting 
                     * Save pipeline models & threshold configs
                     * Generate lookups (geohash, zone-hour, corridor)
                                   │
-                                  ▼
-                    [ Premium Streamlit Dashboard ]
-                    * Predictor, Maps, Analytics & Reports
+                  ┌───────────────┼───────────────┐
+                  ▼               ▼               ▼
+          [ Streamlit ]    [ REST API ]    [ Online Learning ]
+          * 6-page dashboard * FastAPI       * Drift Detection
+          * Chatbot          * /predict      * Incremental Retrain
+          * Monitoring       * /ingest       * Lookup Updates
+```
+
+---
+
+## 📂 Project Structure
+
+```
+event-driven-congestion/
+├── app.py                  # Streamlit dashboard (6 pages)
+├── chatbot.py              # Rule-based NLU chatbot engine
+├── online_update.py        # Online learning, drift detection, prediction logging
+├── api.py                  # FastAPI REST API for external integrations
+├── train_pipeline.py       # Full ML training pipeline
+├── requirements.txt        # Python dependencies
+├── README.md               # This file
+├── INTERFACE_GUIDE.md      # Detailed UI/UX specification
+├── Astram_event_data_anonymized.csv   # Raw ASTRAM dataset
+├── models/                 # Serialized models, lookups, and configs
+│   ├── priority_classifier.pkl
+│   ├── closure_classifier.pkl
+│   ├── duration_regressor.pkl
+│   ├── dbscan_clusterer.pkl
+│   ├── cluster_profiles.pkl / cluster_points.pkl
+│   ├── feature_list.pkl / feature_list_priority.pkl
+│   ├── geohash_lookup.pkl / zone_hour_lookup.pkl / corridor_risk_lookup.pkl
+│   ├── global_medians.pkl / closure_best_threshold.pkl
+│   ├── preprocessor.pkl
+│   ├── eval_metrics.json
+│   └── retrain_log.json (created by online_update.py)
+└── logs/                   # Prediction logs (created at runtime)
+    └── prediction_log.csv
 ```
 
 ---
@@ -130,7 +164,256 @@ The rule-based Recommendation Engine maps these high-accuracy predictions into c
 * **Barricading Adequacy**: Uses predicted road closure probability to determine heavy vs. light equipment deployment, preventing expensive material over-allocation.
 * **Diversion Strategy**: Synthesizes peak-hour traffic indices, estimated duration, and closure probability to determine whether a diversion should be activated. During commute rush hours (7-9 AM, 5-8 PM), even moderate closure probabilities trigger urgent rerouting alerts, helping coordinate with GPS services (like Waze and Google Maps) in advance to minimize area-wide congestion.
 
+---
 
+## 🤖 Chatbot Assistant — NLU Engine
+
+The **ASTRAM Traffic Assistant** (`chatbot.py`) provides a natural-language conversational interface for traffic control operators, removing the need to navigate forms and fill 10+ input fields.
+
+### How It Works
+
+The chatbot uses a **Rule-Based Natural Language Understanding (NLU)** pipeline — no external API keys required:
+
+```
+User Input (text)
+       │
+       ▼
+┌─────────────────────────┐
+│   Intent Classifier     │
+│   (keyword + regex)     │
+│                         │
+│  1. Match greeting/help │
+│  2. Match metrics words │
+│  3. Match compare/vs    │
+│  4. Match hotspot words │
+│  5. Match explain words │
+│  6. Extract lat/lon,    │
+│     hour, cause, zone   │
+│     → predict intent    │
+│  7. Fallback → help     │
+└────────┬────────────────┘
+         │
+         ▼
+┌─────────────────────────┐
+│   Parameter Extractor   │
+│                         │
+│  • Lat/Lon: regex       │
+│    (\d{2}\.\d+, \d{2})  │
+│  • Hour: "5pm" → 17     │
+│  • Cause: keyword map   │
+│    "accident" → accident│
+│  • Zone: fuzzy keyword  │
+│  • Corridor: keyword    │
+│  • Day: "Monday" → 0    │
+└────────┬────────────────┘
+         │
+         ▼
+┌─────────────────────────┐
+│   Response Generator    │
+│                         │
+│  predict → run ML models│
+│  hotspot → filter DBSCAN│
+│  compare → lookup scores│
+│  explain → return rules │
+│  status  → eval_metrics │
+│  help    → capability   │
+└─────────────────────────┘
+```
+
+### Supported Intents
+
+| Intent | Example User Input | What Happens |
+|---|---|---|
+| `predict` | *"accident at 12.97, 77.59 at 5pm"* | Extracts coordinates, hour, and cause → runs all 3 ML models → returns priority, closure risk, duration, and resource recommendations in a formatted table |
+| `hotspot` | *"show hotspots in Central Zone 2"* | Filters DBSCAN cluster profiles → returns top 5 clusters with event counts and priority rates |
+| `compare` | *"compare Mysore Road vs Hosur Road"* | Looks up corridor risk scores → returns side-by-side comparison table with risk levels |
+| `explain` | *"why is priority high for protests?"* | Returns rule-based explanation of how the recommendation engine works for that specific topic |
+| `status` | *"model accuracy?"* | Returns current model evaluation metrics (ROC-AUC, F1, MAE, R²) from `eval_metrics.json` |
+| `help` | *"what can you do?"* | Lists all chatbot capabilities with example queries |
+
+### Smart Parameter Handling
+
+The chatbot intelligently **auto-fills defaults** for any parameters not mentioned, and **informs the user** which defaults were applied:
+- **Location**: Defaults to Majestic (12.9716, 77.5946) if no lat/lon is provided
+- **Hour**: Defaults to the current system hour
+- **Event cause**: Defaults to `congestion`
+- **Zone**: Defaults to `Central Zone 2`
+- **Day/Month**: Defaults to current day and month
+
+### Keyword Dictionaries
+
+The NLU engine includes comprehensive synonym mapping:
+* **30+ cause synonyms**: `"crash"` → `accident`, `"flooding"` → `water_logging`, `"bandh"` → `protest`, `"tree fell"` → `tree_fall`, etc.
+* **10 zone aliases**: `"central 2"` → `Central Zone 2`, `"north 1"` → `North Zone 1`, etc.
+* **10 corridor aliases**: `"mysore"` → `Mysore Road`, `"bellary"` → `Bellary Road 1`, etc.
+* **7 day abbreviations**: `"mon"` → Monday (0), `"sat"` → Saturday (5), etc.
+
+---
+
+## 🔄 Online Learning & Drift Detection
+
+The **Online Learning module** (`online_update.py`) provides infrastructure for keeping models fresh as traffic patterns evolve over time.
+
+### Why Online Learning?
+
+| Factor | Justification |
+|---|---|
+| **Data arrives continuously** | ASTRAM generates new traffic events every day |
+| **Distribution shift** | New roads, metro lines, seasonal patterns, and policy changes alter traffic behavior |
+| **Retraining cost** | Full retraining on growing datasets becomes expensive over time |
+| **Stale lookups** | New geohash cells (new areas of the city) have no historical context |
+
+### Components
+
+#### 1. Prediction Logger (`PredictionLogger`)
+Every prediction made through the dashboard or API is logged to `logs/prediction_log.csv`:
+```
+timestamp, latitude, longitude, hour, day_of_week, month,
+event_cause, zone, corridor, priority_prob, closure_prob,
+duration_est_min, manpower_level, barricading_level,
+diversion_level, actual_priority, actual_closure,
+actual_duration_min, feedback_correct
+```
+* Ground truth fields (`actual_*` and `feedback_correct`) are empty at prediction time and can be filled later when the real outcome is known, enabling supervised retraining.
+
+#### 2. Drift Detector (`DriftDetector`)
+Uses **Population Stability Index (PSI)** to detect when model predictions or input features have drifted from their training distributions:
+
+```
+PSI = Σ (P_current - P_reference) × ln(P_current / P_reference)
+```
+
+| PSI Value | Interpretation |
+|---|---|
+| < 0.10 | ✅ No significant drift — model is stable |
+| 0.10 – 0.25 | ⚠️ Moderate drift — monitor closely |
+| > 0.25 | 🔴 Significant drift — consider retraining |
+
+The drift detector compares the first half vs. second half of the prediction log window, measuring PSI for priority probability, closure probability, and estimated duration.
+
+#### 3. Incremental Retrainer (`IncrementalRetrainer`)
+Supports **sliding-window micro-retraining**:
+1. Loads data from the last N months (configurable, default 6)
+2. Runs the same preprocessing pipeline as `train_pipeline.py`
+3. Supports LightGBM **continuation training** (warm-start from existing booster weights)
+4. **Validation gate**: New models are only promoted if they don't degrade by more than 5% from current metrics — rejected models are logged but not deployed
+
+#### 4. Lookup Updater (`LookupUpdater`)
+Incrementally updates geohash lookup tables as new events arrive using **Exponential Moving Average (EMA)** blending:
+```
+new_value = α × incoming + (1 - α) × existing    (α = 0.3)
+```
+This keeps lookup tables fresh without requiring a full retrain — new geohash cells are automatically added, and existing cells smoothly incorporate recent data.
+
+### CLI Usage
+
+```bash
+# Run incremental retraining on the last 6 months of data
+python online_update.py --retrain --window-months 6
+
+# Run drift detection on prediction logs
+python online_update.py --drift
+
+# Custom data source and window
+python online_update.py --retrain --data path/to/new_data.csv --window-months 3
+```
+
+---
+
+## 🌐 REST API (FastAPI)
+
+The **REST API** (`api.py`) decouples ML predictions from the Streamlit UI, enabling external systems (mobile apps, IoT sensors, CCTV systems, Waze/Google Maps) to consume predictions programmatically.
+
+### Starting the API Server
+
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/predict` | POST | Run ML models and return predictions + resource recommendations |
+| `/ingest` | POST | Buffer a new labeled event for incremental lookup updates |
+| `/health` | GET | Health check — reports model loading status |
+| `/metrics` | GET | Returns current model evaluation metrics (`eval_metrics.json`) |
+| `/drift` | GET | Runs drift detection on prediction logs and returns PSI values |
+| `/docs` | GET | Auto-generated interactive Swagger UI documentation |
+
+### Example: Predict Endpoint
+
+**Request:**
+```bash
+curl -X POST http://localhost:8000/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "latitude": 12.9716,
+    "longitude": 77.5946,
+    "hour": 17,
+    "day_of_week": 0,
+    "month": 6,
+    "event_cause": "accident",
+    "event_type": "unplanned",
+    "veh_type": "private_car",
+    "zone": "Central Zone 2",
+    "corridor": "Non-corridor",
+    "police_station": "Cubbon Park"
+  }'
+```
+
+**Response:**
+```json
+{
+  "priority_risk": 0.1234,
+  "priority_label": "LOW",
+  "closure_risk": 0.0567,
+  "closure_label": "UNLIKELY",
+  "estimated_duration_min": 62,
+  "geohash": "tdr1y6",
+  "recommendations": {
+    "manpower": "LOW — 2 officers sufficient",
+    "barricading": "MINIMAL — Cones / soft barricades only",
+    "diversion": "MONITOR — No diversion needed currently",
+    "estimated_duration_min": 62,
+    "priority_score": "12.3%",
+    "closure_risk": "5.7%"
+  },
+  "timestamp": "2026-06-19T12:00:00"
+}
+```
+
+### Example: Ingest Endpoint (for Online Learning)
+
+```bash
+curl -X POST http://localhost:8000/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "latitude": 12.98,
+    "longitude": 77.61,
+    "hour": 9,
+    "event_cause": "accident",
+    "zone": "Central Zone 2",
+    "corridor": "Hosur Road",
+    "priority": "High",
+    "requires_road_closure": 1,
+    "duration_minutes": 45.0
+  }'
+```
+
+---
+
+## 📡 Model Monitoring Dashboard
+
+The **Model Monitoring** page (Page 6 in the Streamlit dashboard) provides real-time visibility into model health:
+
+* **Prediction Volume Cards**: Total predictions, last 24-hour count, average priority risk, average closure risk.
+* **Distribution Histograms**: Priority and closure risk distributions across all logged predictions — visual check for distribution shift.
+* **PSI Drift Detection Table**: Computes Population Stability Index for each prediction output and flags drift status (✅ Stable / ⚠️ Drifting / 🔴 Significant Shift).
+* **Recent Prediction Log**: Scrollable table of the last 20 predictions with timestamps, cause, zone, and all prediction outputs.
+* **Online Learning Status**: Displays the timestamp, status, and data size of the most recent incremental retrain (from `models/retrain_log.json`).
+
+---
 
 ## 🚀 How to Run the Project
 
@@ -166,3 +449,38 @@ Open [http://localhost:8501](http://localhost:8501) in your browser to interact 
 * **🗺️ Hotspot Map**: Track density hotspots in Bengaluru.
 * **📊 Dataset Analytics**: Run charts explaining event causes, hour peaks, and zones.
 * **📋 Model Performance**: Inspect validation scores and feature importance.
+* **💬 ASTRAM Assistant**: Chat with the AI assistant to get predictions, explore hotspots, and understand models through natural language.
+* **📡 Model Monitoring**: Track prediction quality, detect drift, and monitor online learning status.
+
+### 4. Start the REST API (Optional)
+For external system integrations:
+```bash
+uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+```
+Visit [http://localhost:8000/docs](http://localhost:8000/docs) for interactive Swagger documentation.
+
+### 5. Run Online Learning (Optional)
+To incrementally retrain models or check for drift:
+```bash
+# Incremental retrain on the last 6 months
+python online_update.py --retrain --window-months 6
+
+# Check drift in prediction logs
+python online_update.py --drift
+```
+
+---
+
+## 🛠️ Technology Stack
+
+| Component | Technology |
+|---|---|
+| ML Models | LightGBM, XGBoost, scikit-learn, imbalanced-learn |
+| Feature Engineering | pandas, numpy, pygeohash, category_encoders |
+| Dashboard | Streamlit, Plotly |
+| Chatbot NLU | Custom rule-based (regex + keyword dictionaries) |
+| REST API | FastAPI, Uvicorn, Pydantic |
+| Spatial Clustering | DBSCAN (haversine metric) |
+| Drift Detection | Population Stability Index (PSI) |
+| Online Learning | LightGBM continuation training, EMA lookup updates |
+| Model Persistence | joblib, JSON |
