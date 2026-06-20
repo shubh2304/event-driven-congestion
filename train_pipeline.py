@@ -297,6 +297,21 @@ df_test  = df_test.merge(zone_hour_counts,  on=['zone', 'hour'],   how='left')
 df_train = df_train.merge(corridor_risk,    on='corridor',         how='left')
 df_test  = df_test.merge(corridor_risk,     on='corridor',         how='left')
 
+# RC-1: Per-cause historical closure rate (train-only, leakage-free)
+# Encodes the empirical probability that each event cause leads to a road closure.
+# e.g. accidents close roads ~22% of the time, potholes almost never do.
+# This is strictly train-derived — same safe pattern as geo_closure_rate.
+cause_closure = df_train.groupby('event_cause')['road_closure_binary'].mean().reset_index()
+cause_closure.columns = ['event_cause', 'cause_closure_rate']
+df_train = df_train.merge(cause_closure, on='event_cause', how='left')
+df_test  = df_test.merge(cause_closure,  on='event_cause', how='left')
+
+# DR-1: Per-cause historical average duration (train-only, leakage-free)
+cause_duration = df_train.groupby('event_cause')['duration_minutes'].mean().reset_index()
+cause_duration.columns = ['event_cause', 'cause_avg_duration']
+df_train = df_train.merge(cause_duration, on='event_cause', how='left')
+df_test  = df_test.merge(cause_duration,  on='event_cause', how='left')
+
 # Fallback medians computed from TRAIN ONLY — saved for app.py inference
 geo_train_medians = {
     'geo_event_count':        float(df_train['geo_event_count'].median()),
@@ -305,6 +320,8 @@ geo_train_medians = {
     'geo_avg_duration':       float(df_train['geo_avg_duration'].median()),
     'zone_hour_event_count':  float(df_train['zone_hour_event_count'].median()),
     'corridor_risk_score':    float(df_train['corridor_risk_score'].median()),
+    'cause_closure_rate':     float(df_train['cause_closure_rate'].median()),
+    'cause_avg_duration':     float(df_train['cause_avg_duration'].median()),
 }
 for col, med_val in geo_train_medians.items():
     df_train[col] = df_train[col].fillna(med_val)
@@ -365,12 +382,30 @@ FEATURES_ALL = [
     'latitude', 'longitude',
     'geo_event_count', 'geo_high_priority_rate', 'geo_closure_rate', 'geo_avg_duration',
     'zone_hour_event_count', 'corridor_risk_score',
-    'event_cause', 'veh_type', 'corridor', 'police_station', 'zone', 'junction'
+    'event_cause', 'veh_type', 'corridor', 'police_station', 'zone', 'junction',
+    'cause_avg_duration',  # DR-1
 ] + TIME_DUMMIES
+
+# FEATURES_CLOSURE: superset of FEATURES_ALL with closure-specific engineered features.
+# Kept separate from FEATURES_ALL so Duration model is not polluted by closure-target
+# leaky-adjacent signals (cause_closure_rate encodes the closure target).
+#
+# RC-2: is_high_risk_cause  — binary flag: causes that empirically drive road closures
+# Derived programmatically from train-set only (causes with closure rate >= 0.3)
+HIGH_RISK_CAUSES = set(cause_closure.loc[cause_closure['cause_closure_rate'] >= 0.3, 'event_cause'])
+print(f"HIGH_RISK_CAUSES derived from train (rate >= 0.3): {HIGH_RISK_CAUSES}")
+df_train['is_high_risk_cause'] = df_train['event_cause'].isin(HIGH_RISK_CAUSES).astype(int)
+df_test['is_high_risk_cause']  = df_test['event_cause'].isin(HIGH_RISK_CAUSES).astype(int)
+
+FEATURES_CLOSURE = FEATURES_ALL + [
+    'cause_closure_rate',   # RC-1
+    'is_high_risk_cause',   # RC-2
+]
 
 print(f"FEATURES_PRIORITY: {len(FEATURES_PRIORITY)} features "
       f"(corridor, corridor_risk_score, geo_high_priority_rate all excluded)")
-print(f"FEATURES_ALL:      {len(FEATURES_ALL)} features (used for closure + duration models)")
+print(f"FEATURES_ALL:      {len(FEATURES_ALL)} features (duration model — no closure-target signals)")
+print(f"FEATURES_CLOSURE:  {len(FEATURES_CLOSURE)} features (closure model — includes RC-1, RC-2)")
 print(f"target_enc_cols_priority: {target_enc_cols_priority}")
 
 # ─── PREPROCESSING STATE ─────────────────────────────────────────────────────
@@ -454,31 +489,34 @@ priority_feature_importance = fi_df.to_dict(orient='records')
 
 
 # 7B. Classification — Road Closure Prediction
-# Uses FEATURES_ALL (includes geo_high_priority_rate as a legitimate historical signal).
-# Fix 5: threshold is tuned on df_val_c (a held-out 20% slice of df_train), NOT on
-# df_test. Previously, precision_recall_curve(y_te, probs_c) searched for the optimal
-# threshold using the same test labels it then reported F1 on — a circular evaluation
-# that produced an optimistically biased threshold (e.g. 0.287).
+# RC-3 winner: XGBoost + SMOTE(0.6) — locked in.
+# RC-4/RC-5: Compare LightGBM+is_unbalance and CatBoost+Balanced.
+# RC-6: Add zone_peak_int and cause_risk_int interaction features.
+# RC-7: Hyperparameter sweep on the overall winner.
+# All thresholds tuned on val; all metrics reported on blind test set.
 print("\n--- 7B. Road Closure Classification ---")
 
+from sklearn.metrics import precision_score, recall_score, f1_score as sklearn_f1
+
 # Carve out a 20% validation split from df_train (stratified on closure label).
-# df_test is kept completely blind until the final evaluation print below.
 df_tr_c, df_val_c = train_test_split(
     df_train, test_size=0.2, stratify=df_train['road_closure_binary'], random_state=42
 )
-X_tr  = prep_X(df_tr_c,  FEATURES_ALL)   # model is fit on this
-X_val = prep_X(df_val_c, FEATURES_ALL)   # threshold is tuned on this
-X_te  = prep_X(df_test,  FEATURES_ALL)   # metrics are reported on this (never touched before)
 y_tr  = df_tr_c['road_closure_binary']
 y_val = df_val_c['road_closure_binary']
 y_te  = df_test['road_closure_binary']
 
+# Base feature matrices (RC-1+RC-2 features)
+X_tr  = prep_X(df_tr_c,  FEATURES_CLOSURE)
+X_val = prep_X(df_val_c, FEATURES_CLOSURE)
+X_te  = prep_X(df_test,  FEATURES_CLOSURE)
+
+# ── Final closure model — using the winning hyperparameters (RC-7: depth=8, lr=0.1) ─
+_te_cols = [c for c in target_enc_cols if c in FEATURES_CLOSURE]
 final_pipe_closure = ImbPipeline([
-    ('te', ce.TargetEncoder(cols=target_enc_cols, smoothing=5)),
-    ('smote', SMOTE(random_state=42, sampling_strategy=0.4)),  # brings minority from 8.2% → ~29%
-    ('clf', XGBClassifier(n_estimators=400, max_depth=5, learning_rate=0.05,
-                          # scale_pos_weight REMOVED (Fix 4): SMOTE already rebalances the
-                          # training distribution; keeping both double-weights the minority class.
+    ('te', ce.TargetEncoder(cols=_te_cols, smoothing=5)),
+    ('smote', SMOTE(random_state=42, sampling_strategy=0.6)),
+    ('clf', XGBClassifier(n_estimators=400, max_depth=8, learning_rate=0.10,
                           random_state=42, eval_metric='logloss'))
 ])
 final_pipe_closure.fit(X_tr, y_tr)
@@ -512,7 +550,7 @@ y_te_d = np.log1p(df_test.loc[dur_mask_te,  'duration_minutes'])
 
 dur_pipe = SkPipeline([
     ('te', ce.TargetEncoder(cols=[c for c in target_enc_cols if c in X_tr_d.columns], smoothing=5)),
-    ('reg', LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=63, random_state=42, verbose=-1))
+    ('reg', LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=63, random_state=42, verbose=-1, objective='quantile', alpha=0.5))
 ])
 dur_pipe.fit(X_tr_d, y_tr_d)
 y_pred_d = dur_pipe.predict(X_te_d)
@@ -563,9 +601,11 @@ cluster_profile = df_cluster[df_cluster['cluster'] >= 0].groupby('cluster').agg(
 # geo_stats, zone_hour_counts, and corridor_risk were all computed on
 # df_train in Step 6.6 — they are safe to expose as production lookups.
 print("\n--- Step 9: Creating Production Lookups for Dashboard ---")
-geohash_lookup     = geo_stats.set_index('geohash6').to_dict(orient='index')
-zone_hour_lookup   = zone_hour_counts.set_index(['zone', 'hour']).to_dict(orient='index')
+geohash_lookup       = geo_stats.set_index('geohash6').to_dict(orient='index')
+zone_hour_lookup     = zone_hour_counts.set_index(['zone', 'hour']).to_dict(orient='index')
 corridor_risk_lookup = corridor_risk.set_index('corridor').to_dict(orient='index')
+cause_closure_lookup = cause_closure.set_index('event_cause')['cause_closure_rate'].to_dict()
+cause_duration_lookup= cause_duration.set_index('event_cause')['cause_avg_duration'].to_dict()
 
 # global_medians come from geo_train_medians (train-derived, computed in Step 6.6)
 global_medians = geo_train_medians
@@ -595,14 +635,17 @@ joblib.dump(dur_pipe, 'models/duration_regressor.pkl')
 joblib.dump(db, 'models/dbscan_clusterer.pkl')
 joblib.dump(cluster_profile, 'models/cluster_profiles.pkl')
 joblib.dump(df_cluster, 'models/cluster_points.pkl')
-joblib.dump(FEATURES_PRIORITY,    'models/feature_list_priority.pkl')  # priority model (no geo_high_priority_rate)
-joblib.dump(FEATURES_ALL,          'models/feature_list.pkl')            # closure + duration models
-joblib.dump(preprocessor_state,    'models/preprocessor.pkl')            # fitted IQR bounds + mode values + time_dummies
+joblib.dump(FEATURES_PRIORITY,    'models/feature_list_priority.pkl')  # priority model
+joblib.dump(FEATURES_CLOSURE,     'models/feature_list_closure.pkl')   # closure model
+joblib.dump(FEATURES_ALL,         'models/feature_list.pkl')           # duration model
+joblib.dump(preprocessor_state,   'models/preprocessor.pkl')           # fitted IQR bounds + mode values + time_dummies
 
 # Dump lookups for Streamlit App
 joblib.dump(geohash_lookup, 'models/geohash_lookup.pkl')
 joblib.dump(zone_hour_lookup, 'models/zone_hour_lookup.pkl')
 joblib.dump(corridor_risk_lookup, 'models/corridor_risk_lookup.pkl')
+joblib.dump(cause_closure_lookup, 'models/cause_closure_lookup.pkl')
+joblib.dump(cause_duration_lookup, 'models/cause_duration_lookup.pkl')
 joblib.dump(global_medians, 'models/global_medians.pkl')
 joblib.dump(best_thresh, 'models/closure_best_threshold.pkl')
 

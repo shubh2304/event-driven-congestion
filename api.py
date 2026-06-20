@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import joblib
 import json
+import logging
 from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -90,10 +91,13 @@ async def lifespan(app: FastAPI):
             'closure':           joblib.load('models/closure_classifier.pkl'),
             'duration':          joblib.load('models/duration_regressor.pkl'),
             'features_priority': joblib.load('models/feature_list_priority.pkl'),
+            'features_closure':  joblib.load('models/feature_list_closure.pkl'),
             'features':          joblib.load('models/feature_list.pkl'),
             'geohash_lookup':    joblib.load('models/geohash_lookup.pkl'),
             'zone_hour_lookup':  joblib.load('models/zone_hour_lookup.pkl'),
             'corridor_risk_lookup': joblib.load('models/corridor_risk_lookup.pkl'),
+            'cause_closure_lookup': joblib.load('models/cause_closure_lookup.pkl'),
+            'cause_duration_lookup': joblib.load('models/cause_duration_lookup.pkl'),
             'global_medians':    joblib.load('models/global_medians.pkl'),
             'closure_best_thresh': joblib.load('models/closure_best_threshold.pkl'),
             'preprocessor':      joblib.load('models/preprocessor.pkl'),
@@ -253,6 +257,14 @@ async def predict(event: EventInput):
     corridor_risk_score = (crl[ck].get('corridor_risk_score', gm['corridor_risk_score'])
                            if ck in crl else gm['corridor_risk_score'])
 
+    # Cause closure rate lookup (RC-1)
+    ccl = models['cause_closure_lookup']
+    cause_closure_rate = ccl.get(event.event_cause, gm['cause_closure_rate'])
+
+    # Cause average duration lookup (DR-1)
+    cdl = models['cause_duration_lookup']
+    cause_avg_duration = cdl.get(event.event_cause, gm['cause_avg_duration'])
+
     input_dict = {
         'is_planned': int(event.event_type == 'planned'),
         'hour': event.hour,
@@ -274,6 +286,9 @@ async def predict(event: EventInput):
         'geo_avg_duration': geo_avg_duration,
         'zone_hour_event_count': zone_hour_event_count,
         'corridor_risk_score': corridor_risk_score,
+        'cause_closure_rate': cause_closure_rate,
+        'cause_avg_duration': cause_avg_duration,
+        'is_high_risk_cause': int(cause_closure_rate >= 0.3),
     }
 
     for dummy_col in models['preprocessor']['time_dummies']:
@@ -290,14 +305,16 @@ async def predict(event: EventInput):
         return df[feat_list]
 
     df_prio = align(input_df, models['features_priority'])
+    df_closure = align(input_df, models['features_closure'])
     df_all = align(input_df, models['features'])
 
     prio_prob = float(models['priority'].predict_proba(df_prio)[0][1])
-    close_prob = float(models['closure'].predict_proba(df_all)[0][1])
+    close_prob = float(models['closure'].predict_proba(df_closure)[0][1])
     try:
         dur_log = models['duration'].predict(df_all)[0]
-        dur_est = float(np.expm1(dur_log))
-    except Exception:
+        dur_est = max(1.0, float(np.expm1(dur_log)))
+    except Exception as e:
+        logging.warning(f"Duration prediction failed: {e}")
         dur_est = 60.0
 
     thresh = models['closure_best_thresh']

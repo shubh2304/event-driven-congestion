@@ -50,7 +50,7 @@ class PredictionLogger:
                 'diversion_level,actual_priority,actual_closure,'
                 'actual_duration_min,feedback_correct\n'
             )
-            with open(self.log_file, 'w') as f:
+            with open(self.log_file, 'w', encoding='utf-8') as f:
                 f.write(header)
 
     def log_prediction(self, input_params: dict, predictions: dict,
@@ -85,14 +85,17 @@ class PredictionLogger:
             'barricading_level', 'diversion_level', 'actual_priority',
             'actual_closure', 'actual_duration_min', 'feedback_correct'
         ])
-        with open(self.log_file, 'a') as f:
+        with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(line + '\n')
 
     def get_recent_predictions(self, hours: int = 24) -> pd.DataFrame:
         """Load predictions from the last N hours."""
         if not os.path.exists(self.log_file):
             return pd.DataFrame()
-        df = pd.read_csv(self.log_file, parse_dates=['timestamp'])
+        try:
+            df = pd.read_csv(self.log_file, parse_dates=['timestamp'], encoding='utf-8')
+        except UnicodeDecodeError:
+            df = pd.read_csv(self.log_file, parse_dates=['timestamp'], encoding='cp1252')
         cutoff = datetime.now() - timedelta(hours=hours)
         return df[df['timestamp'] >= cutoff]
 
@@ -100,7 +103,10 @@ class PredictionLogger:
         """Load all logged predictions."""
         if not os.path.exists(self.log_file):
             return pd.DataFrame()
-        return pd.read_csv(self.log_file, parse_dates=['timestamp'])
+        try:
+            return pd.read_csv(self.log_file, parse_dates=['timestamp'], encoding='utf-8')
+        except UnicodeDecodeError:
+            return pd.read_csv(self.log_file, parse_dates=['timestamp'], encoding='cp1252')
 
 
 # ─── DRIFT DETECTION ────────────────────────────────────────────
@@ -309,13 +315,13 @@ class IncrementalRetrainer:
         log_path = os.path.join(self.model_dir, 'retrain_log.json')
         logs = []
         if os.path.exists(log_path):
-            with open(log_path, 'r') as f:
+            with open(log_path, 'r', encoding='utf-8') as f:
                 try:
                     logs = json.load(f)
                 except json.JSONDecodeError:
                     logs = []
         logs.append(result)
-        with open(log_path, 'w') as f:
+        with open(log_path, 'w', encoding='utf-8') as f:
             json.dump(logs, f, indent=2, default=str)
 
     def run_incremental_retrain(self, months: int = 6,
