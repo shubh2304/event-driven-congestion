@@ -1,11 +1,11 @@
 {
   "priority_roc_auc": 0.9856,
   "priority_f1_weighted": 0.9625,
-  "closure_roc_auc": 0.6811,
-  "closure_best_threshold": 0.396,
-  "duration_mae": 55.4,
-  "duration_medae": 32.3,
-  "duration_r2": 0.2209,
+  "closure_roc_auc": 0.7054,
+  "closure_best_threshold": 0.207,
+  "duration_mae": 52.1,
+  "duration_medae": 29.7,
+  "duration_r2": 0.2744,
   "priority_feature_importance": [
     {
       "feature": "longitude",

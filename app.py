@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import logging
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
@@ -153,11 +154,14 @@ def load_models():
         'duration':          joblib.load('models/duration_regressor.pkl'),
         'cluster_profile':   joblib.load('models/cluster_profiles.pkl'),
         'cluster_points':    joblib.load('models/cluster_points.pkl'),
-        'features_priority': joblib.load('models/feature_list_priority.pkl'),  # no geo_high_priority_rate
-        'features':          joblib.load('models/feature_list.pkl'),            # closure + duration
+        'features_priority': joblib.load('models/feature_list_priority.pkl'),  # priority model
+        'features_closure':  joblib.load('models/feature_list_closure.pkl'),   # closure model
+        'features':          joblib.load('models/feature_list.pkl'),            # duration model
         'geohash_lookup':    joblib.load('models/geohash_lookup.pkl'),
         'zone_hour_lookup':  joblib.load('models/zone_hour_lookup.pkl'),
         'corridor_risk_lookup': joblib.load('models/corridor_risk_lookup.pkl'),
+        'cause_closure_lookup': joblib.load('models/cause_closure_lookup.pkl'),
+        'cause_duration_lookup': joblib.load('models/cause_duration_lookup.pkl'),
         'global_medians':    joblib.load('models/global_medians.pkl'),
         'closure_best_thresh': joblib.load('models/closure_best_threshold.pkl'),
         'preprocessor':      joblib.load('models/preprocessor.pkl'),            # IQR bounds + mode values + time_dummies
@@ -338,6 +342,18 @@ if page == "🔮 Event Impact Predictor":
         else:
             corridor_risk_score = global_medians['corridor_risk_score']
 
+        # Real lookup for cause closure rate
+        if event_cause in models['cause_closure_lookup']:
+            cause_closure_rate = models['cause_closure_lookup'][event_cause]
+        else:
+            cause_closure_rate = global_medians['cause_closure_rate']
+
+        # Real lookup for cause average duration
+        if event_cause in models['cause_duration_lookup']:
+            cause_avg_duration = models['cause_duration_lookup'][event_cause]
+        else:
+            cause_avg_duration = global_medians['cause_avg_duration']
+
         input_dict = {
             'is_planned': int(event_type == 'planned'),
             'hour': event_hour,
@@ -359,6 +375,9 @@ if page == "🔮 Event Impact Predictor":
             'geo_avg_duration': geo_avg_duration,
             'zone_hour_event_count': zone_hour_event_count,
             'corridor_risk_score': corridor_risk_score,
+            'cause_closure_rate': cause_closure_rate,
+            'cause_avg_duration': cause_avg_duration,
+            'is_high_risk_cause': int(cause_closure_rate >= 0.3),
         }
 
         # Add time_of_day OHE dummies using the exact column list saved at training time.
@@ -378,18 +397,21 @@ if page == "🔮 Event Impact Predictor":
                     df_aligned[c] = 0
             return df_aligned[feat_list]
 
-        # Priority model uses FEATURES_PRIORITY (geo_high_priority_rate excluded)
+        # Priority model uses FEATURES_PRIORITY
         input_df_priority = align_features(input_df_base, models['features_priority'])
-        # Closure + Duration models use FEATURES_ALL (geo_high_priority_rate included)
+        # Closure model uses FEATURES_CLOSURE
+        input_df_closure  = align_features(input_df_base, models['features_closure'])
+        # Duration model uses FEATURES_ALL
         input_df_all      = align_features(input_df_base, models['features'])
 
         with st.spinner("Running ML models..."):
             prio_prob  = models['priority'].predict_proba(input_df_priority)[0][1]
-            close_prob = models['closure'].predict_proba(input_df_all)[0][1]
+            close_prob = models['closure'].predict_proba(input_df_closure)[0][1]
             try:
                 dur_log = models['duration'].predict(input_df_all)[0]
-                dur_est = np.expm1(dur_log)
-            except Exception:
+                dur_est = max(1.0, np.expm1(dur_log))
+            except Exception as e:
+                logging.warning(f"Duration prediction failed: {e}")
                 dur_est = 60.0
 
         recs = generate_recommendations(prio_prob, close_prob, dur_est, event_cause, event_hour, zone, closure_thresh=closure_best_thresh)

@@ -13,6 +13,7 @@ Supports natural-language queries from traffic control operators:
 import re
 import numpy as np
 import pandas as pd
+import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
@@ -315,6 +316,18 @@ def generate_predict_response(params: dict, models: dict, encode_geohash_fn,
     else:
         corridor_risk_score = global_medians['corridor_risk_score']
 
+    # Cause closure rate lookup (RC-1)
+    if event_cause in models['cause_closure_lookup']:
+        cause_closure_rate = models['cause_closure_lookup'][event_cause]
+    else:
+        cause_closure_rate = global_medians['cause_closure_rate']
+
+    # Cause average duration lookup (DR-1)
+    if event_cause in models['cause_duration_lookup']:
+        cause_avg_duration = models['cause_duration_lookup'][event_cause]
+    else:
+        cause_avg_duration = global_medians['cause_avg_duration']
+
     input_dict = {
         'is_planned': 0,
         'hour': event_hour,
@@ -336,6 +349,9 @@ def generate_predict_response(params: dict, models: dict, encode_geohash_fn,
         'geo_avg_duration': geo_avg_duration,
         'zone_hour_event_count': zone_hour_event_count,
         'corridor_risk_score': corridor_risk_score,
+        'cause_closure_rate': cause_closure_rate,
+        'cause_avg_duration': cause_avg_duration,
+        'is_high_risk_cause': int(cause_closure_rate >= 0.3),
     }
 
     # Add time_of_day OHE dummies
@@ -353,15 +369,17 @@ def generate_predict_response(params: dict, models: dict, encode_geohash_fn,
         return df_aligned[feat_list]
 
     input_df_priority = align_features(input_df_base, models['features_priority'])
-    input_df_all = align_features(input_df_base, models['features'])
+    input_df_closure  = align_features(input_df_base, models['features_closure'])
+    input_df_all      = align_features(input_df_base, models['features'])
 
     # Run predictions
-    prio_prob = models['priority'].predict_proba(input_df_priority)[0][1]
-    close_prob = models['closure'].predict_proba(input_df_all)[0][1]
+    prio_prob  = models['priority'].predict_proba(input_df_priority)[0][1]
+    close_prob = models['closure'].predict_proba(input_df_closure)[0][1]
     try:
         dur_log = models['duration'].predict(input_df_all)[0]
-        dur_est = np.expm1(dur_log)
-    except Exception:
+        dur_est = max(1.0, np.expm1(dur_log))
+    except Exception as e:
+        logging.warning(f"Duration prediction failed: {e}")
         dur_est = 60.0
 
     recs = generate_recommendations_fn(
