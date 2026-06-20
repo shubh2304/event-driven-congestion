@@ -640,6 +640,49 @@ joblib.dump(FEATURES_CLOSURE,     'models/feature_list_closure.pkl')   # closure
 joblib.dump(FEATURES_ALL,         'models/feature_list.pkl')           # duration model
 joblib.dump(preprocessor_state,   'models/preprocessor.pkl')           # fitted IQR bounds + mode values + time_dummies
 
+# ─── STEP 10.5: XAI GLOBAL SHAP EXPLANATIONS ────────────────────────
+print("\n--- Step 10.5: Computing Global SHAP Explanations ---")
+try:
+    from xai_engine import (
+        extract_base_model, transform_data, compute_shap_values,
+        generate_global_importance_plot
+    )
+    
+    # 1. Priority Model SHAP
+    print("Computing SHAP for Priority Classifier...")
+    # Sample 200 rows for background
+    bg_p = df_test.sample(n=min(200, len(df_test)), random_state=42)
+    X_bg_p = prep_X(bg_p, FEATURES_PRIORITY)
+    X_bg_p_transformed = transform_data(final_pipe_priority, X_bg_p)
+    model_p = extract_base_model(final_pipe_priority)
+    _, shap_vals_p = compute_shap_values(model_p, X_bg_p_transformed)
+    fig_p = generate_global_importance_plot(shap_vals_p, FEATURES_PRIORITY, title="Global Feature Importance - Priority")
+    fig_p.write_html('models/xai_global_priority.html')
+    
+    # 2. Closure Model SHAP
+    print("Computing SHAP for Closure Classifier...")
+    bg_c = df_test.sample(n=min(200, len(df_test)), random_state=42)
+    X_bg_c = prep_X(bg_c, FEATURES_CLOSURE)
+    X_bg_c_transformed = transform_data(final_pipe_closure, X_bg_c)
+    model_c = extract_base_model(final_pipe_closure)
+    _, shap_vals_c = compute_shap_values(model_c, X_bg_c_transformed)
+    fig_c = generate_global_importance_plot(shap_vals_c, FEATURES_CLOSURE, title="Global Feature Importance - Road Closure")
+    fig_c.write_html('models/xai_global_closure.html')
+    
+    # 3. Duration Model SHAP
+    print("Computing SHAP for Duration Regressor...")
+    bg_d = df_test.loc[dur_mask_te].sample(n=min(200, dur_mask_te.sum()), random_state=42)
+    X_bg_d = prep_X(bg_d, FEATURES_ALL)
+    X_bg_d_transformed = transform_data(dur_pipe, X_bg_d)
+    model_d = extract_base_model(dur_pipe)
+    _, shap_vals_d = compute_shap_values(model_d, X_bg_d_transformed)
+    fig_d = generate_global_importance_plot(shap_vals_d, FEATURES_ALL, title="Global Feature Importance - Event Duration")
+    fig_d.write_html('models/xai_global_duration.html')
+    
+    print("XAI Global Plots saved to models/ as HTML files.")
+except Exception as e:
+    print(f"Failed to generate SHAP explanations: {e}")
+
 # Dump lookups for Streamlit App
 joblib.dump(geohash_lookup, 'models/geohash_lookup.pkl')
 joblib.dump(zone_hour_lookup, 'models/zone_hour_lookup.pkl')
