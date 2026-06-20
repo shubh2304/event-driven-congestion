@@ -6,28 +6,65 @@ import { getHotspots } from '@/lib/api';
 import PageTransition from '@/components/PageTransition';
 import { IconMap, IconMapPin } from '@/components/SvgIcons';
 
-const MapContainer = dynamic(
-  () => import('react-leaflet').then(mod => mod.MapContainer),
-  { ssr: false }
-);
-const TileLayer = dynamic(
-  () => import('react-leaflet').then(mod => mod.TileLayer),
-  { ssr: false }
-);
-const CircleMarker = dynamic(
-  () => import('react-leaflet').then(mod => mod.CircleMarker),
-  { ssr: false }
-);
-const Popup = dynamic(
-  () => import('react-leaflet').then(mod => mod.Popup),
-  { ssr: false }
-);
-
 const CLUSTER_COLORS = [
   '#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6',
   '#ec4899', '#14b8a6', '#f97316', '#6366f1', '#84cc16',
   '#06b6d4', '#e11d48', '#a855f7', '#22c55e', '#eab308'
 ];
+
+// Single dynamic import for the entire map component to avoid
+// react-leaflet context sharing issues when importing subcomponents separately.
+const HotspotMap = dynamic(
+  () => import('react-leaflet').then((mod) => {
+    const { MapContainer, TileLayer, CircleMarker, Popup } = mod;
+
+    function MapInner({ points }) {
+      return (
+        <MapContainer
+          center={[12.9716, 77.5946]}
+          zoom={12}
+          style={{ width: '100%', height: '100%' }}
+          scrollWheelZoom={true}
+        >
+          <TileLayer
+            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>'
+          />
+          {points.map((pt, i) => (
+            <CircleMarker
+              key={i}
+              center={[pt.latitude, pt.longitude]}
+              radius={5}
+              fillColor={CLUSTER_COLORS[pt.cluster % CLUSTER_COLORS.length]}
+              color={CLUSTER_COLORS[pt.cluster % CLUSTER_COLORS.length]}
+              weight={1}
+              opacity={0.8}
+              fillOpacity={0.6}
+            >
+              <Popup>
+                <div style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.85rem' }}>
+                  <strong>Cluster {pt.cluster}</strong><br />
+                  Cause: {pt.event_cause}<br />
+                  Priority: {pt.priority}
+                </div>
+              </Popup>
+            </CircleMarker>
+          ))}
+        </MapContainer>
+      );
+    }
+
+    return MapInner;
+  }),
+  {
+    ssr: false,
+    loading: () => (
+      <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-surface)' }}>
+        <div className="loading-spinner" />
+      </div>
+    ),
+  }
+);
 
 export default function HotspotsPage() {
   const [data, setData] = useState(null);
@@ -43,12 +80,16 @@ export default function HotspotsPage() {
       .finally(() => setLoading(false));
   }, []);
 
+  // Load leaflet CSS once on mount
   useEffect(() => {
     if (mounted) {
-      const link = document.createElement('link');
-      link.rel = 'stylesheet';
-      link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-      document.head.appendChild(link);
+      // Only add if not already present
+      if (!document.querySelector('link[href*="leaflet"]')) {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+        document.head.appendChild(link);
+      }
     }
   }, [mounted]);
 
@@ -79,37 +120,7 @@ export default function HotspotsPage() {
 
       {mounted && data && (
         <div className="map-container" style={{ marginBottom: '1.5rem' }}>
-          <MapContainer
-            center={[12.9716, 77.5946]}
-            zoom={12}
-            style={{ width: '100%', height: '100%' }}
-            scrollWheelZoom={true}
-          >
-            <TileLayer
-              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>'
-            />
-            {data.points.map((pt, i) => (
-              <CircleMarker
-                key={i}
-                center={[pt.latitude, pt.longitude]}
-                radius={5}
-                fillColor={CLUSTER_COLORS[pt.cluster % CLUSTER_COLORS.length]}
-                color={CLUSTER_COLORS[pt.cluster % CLUSTER_COLORS.length]}
-                weight={1}
-                opacity={0.8}
-                fillOpacity={0.6}
-              >
-                <Popup>
-                  <div style={{ fontFamily: 'Outfit, sans-serif', fontSize: '0.85rem' }}>
-                    <strong>Cluster {pt.cluster}</strong><br />
-                    Cause: {pt.event_cause}<br />
-                    Priority: {pt.priority}
-                  </div>
-                </Popup>
-              </CircleMarker>
-            ))}
-          </MapContainer>
+          <HotspotMap points={data.points} />
         </div>
       )}
 
@@ -157,3 +168,4 @@ export default function HotspotsPage() {
     </PageTransition>
   );
 }
+
