@@ -90,6 +90,8 @@ async def lifespan(app: FastAPI):
             'priority':          joblib.load('models/priority_classifier.pkl'),
             'closure':           joblib.load('models/closure_classifier.pkl'),
             'duration':          joblib.load('models/duration_regressor.pkl'),
+            'cluster_profile':   joblib.load('models/cluster_profiles.pkl'),
+            'cluster_points':    joblib.load('models/cluster_points.pkl'),
             'features_priority': joblib.load('models/feature_list_priority.pkl'),
             'features_closure':  joblib.load('models/feature_list_closure.pkl'),
             'features':          joblib.load('models/feature_list.pkl'),
@@ -103,9 +105,9 @@ async def lifespan(app: FastAPI):
             'preprocessor':      joblib.load('models/preprocessor.pkl'),
             'eval_metrics':      json.load(open('models/eval_metrics.json')),
         }
-        print("✅ All models loaded successfully.")
+        print("[OK] All models loaded successfully.")
     except Exception as e:
-        print(f"❌ Model loading failed: {e}")
+        print(f"[ERROR] Model loading failed: {e}")
         print("   Run `python train_pipeline.py` first.")
     yield
     models.clear()
@@ -391,4 +393,191 @@ async def check_drift():
         "prediction_drift": pred_drift,
         "total_predictions": len(logs),
         "timestamp": datetime.now().isoformat()
+    }
+
+
+# ─── NEW ENDPOINTS FOR NEXT.JS FRONTEND ────────────────────────
+
+from chatbot import parse_user_message, execute_intent
+
+
+class ChatInput(BaseModel):
+    message: str = Field(..., description="User message text")
+
+
+@app.post("/chatbot")
+async def chatbot(chat_input: ChatInput):
+    """Process a chatbot message and return the response."""
+    if not models:
+        raise HTTPException(status_code=503, detail="Models not loaded.")
+
+    parsed = parse_user_message(chat_input.message)
+    response = execute_intent(
+        parsed, models,
+        encode_geohash_fn=encode_geohash,
+        generate_recommendations_fn=generate_recommendations
+    )
+    return {
+        "response": response,
+        "intent": parsed.intent,
+        "timestamp": datetime.now().isoformat()
+    }
+
+
+@app.get("/hotspots")
+async def get_hotspots():
+    """Return cluster profiles and cluster points for the hotspot map."""
+    if not models:
+        raise HTTPException(status_code=503, detail="Models not loaded.")
+
+    cp = models.get('cluster_profile')
+    pts = models.get('cluster_points')
+
+    if cp is None or pts is None:
+        raise HTTPException(status_code=404, detail="Cluster data not available.")
+
+    # Filter to clustered points only (cluster >= 0)
+    clustered = pts[pts['cluster'] >= 0].copy()
+
+    # Replace NaN values with None to prevent serialization errors
+    cp = cp.replace({np.nan: None})
+    clustered = clustered.replace({np.nan: None})
+
+    # Convert to JSON-safe format
+    profiles = cp.to_dict(orient='records')
+    points = clustered[['latitude', 'longitude', 'cluster', 'event_cause', 'priority']].to_dict(orient='records')
+
+    return {
+        "profiles": profiles,
+        "points": points,
+        "total_clusters": len(cp),
+        "total_points": len(points)
+    }
+
+
+# Cache for analytics data
+_analytics_cache = {}
+
+
+@app.get("/analytics")
+async def get_analytics():
+    """Return dataset analytics computed from the raw CSV."""
+    global _analytics_cache
+    if _analytics_cache:
+        return _analytics_cache
+
+    # Load raw data
+    csv_path = "Astram_event_data_anonymized.csv"
+    if not os.path.exists(csv_path):
+        candidates = [f for f in os.listdir('.') if 'Astram event data_anonymized' in f and f.endswith('.csv')]
+        if candidates:
+            csv_path = candidates[0]
+        else:
+            raise HTTPException(status_code=404, detail="Dataset CSV not found.")
+
+    df = pd.read_csv(csv_path)
+    df['start_datetime'] = pd.to_datetime(df['start_datetime'], utc=True, errors='coerce')
+    df['hour'] = df['start_datetime'].dt.hour
+
+    # Overview stats
+    total_events = len(df)
+    unplanned = int((df['event_type'] == 'unplanned').sum())
+    high_priority = int((df['priority'] == 'High').sum())
+    road_closures = int(df['requires_road_closure'].sum())
+
+    # Cause distribution
+    cause_counts = df['event_cause'].str.strip().str.lower().value_counts().reset_index()
+    cause_counts.columns = ['cause', 'count']
+    cause_data = cause_counts.to_dict(orient='records')
+
+    # Hourly distribution
+    hourly = df.groupby('hour').size().reset_index(name='count')
+    hourly_data = hourly.to_dict(orient='records')
+
+    # Zone distribution
+    zone_data_raw = df.groupby('zone').size().reset_index(name='count').dropna()
+    zone_data = zone_data_raw.to_dict(orient='records')
+
+    # Priority by cause
+    cause_priority = df.groupby(['event_cause', 'priority']).size().reset_index(name='count')
+    priority_by_cause = cause_priority.to_dict(orient='records')
+
+    _analytics_cache = {
+        "overview": {
+            "total_events": total_events,
+            "unplanned": unplanned,
+            "high_priority": high_priority,
+            "road_closures": road_closures
+        },
+        "cause_distribution": cause_data,
+        "hourly_distribution": hourly_data,
+        "zone_distribution": zone_data,
+        "priority_by_cause": priority_by_cause
+    }
+
+    return _analytics_cache
+
+
+@app.get("/monitoring/predictions")
+async def get_monitoring_predictions():
+    """Return prediction logs with volume statistics for monitoring."""
+    logs = prediction_logger.get_all_predictions()
+
+    if logs.empty:
+        return {
+            "has_data": False,
+            "total": 0,
+            "last_24h": 0,
+            "avg_priority_risk": 0,
+            "avg_closure_risk": 0,
+            "recent": [],
+            "priority_values": [],
+            "closure_values": []
+        }
+
+    # Recent predictions (last 24h)
+    recent_logs = prediction_logger.get_recent_predictions(hours=24)
+
+    # Average risks
+    prio_vals = pd.to_numeric(logs['priority_prob'], errors='coerce').dropna()
+    close_vals = pd.to_numeric(logs['closure_prob'], errors='coerce').dropna()
+
+    # Recent log entries for table display
+    display_cols = ['timestamp', 'event_cause', 'zone', 'priority_prob',
+                    'closure_prob', 'duration_est_min']
+    available_cols = [c for c in display_cols if c in logs.columns]
+    recent_entries = logs[available_cols].tail(20).sort_values(
+        'timestamp', ascending=False).to_dict(orient='records')
+
+    return {
+        "has_data": True,
+        "total": len(logs),
+        "last_24h": len(recent_logs),
+        "avg_priority_risk": round(float(prio_vals.mean() * 100), 1) if len(prio_vals) > 0 else 0,
+        "avg_closure_risk": round(float(close_vals.mean() * 100), 1) if len(close_vals) > 0 else 0,
+        "recent": recent_entries,
+        "priority_values": [round(float(v * 100), 1) for v in prio_vals.tolist()],
+        "closure_values": [round(float(v * 100), 1) for v in close_vals.tolist()]
+    }
+
+
+@app.get("/monitoring/retrain-status")
+async def get_retrain_status():
+    """Return the online learning retrain status."""
+    retrain_log_path = 'models/retrain_log.json'
+    if not os.path.exists(retrain_log_path):
+        return {"has_retrained": False}
+
+    with open(retrain_log_path, 'r') as f:
+        retrain_logs = json.load(f)
+
+    if not retrain_logs:
+        return {"has_retrained": False}
+
+    last = retrain_logs[-1]
+    return {
+        "has_retrained": True,
+        "last_retrain": last.get('timestamp', 'N/A')[:19],
+        "status": last.get('status', 'N/A'),
+        "data_rows": last.get('data_rows', 'N/A')
     }
