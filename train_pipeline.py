@@ -447,7 +447,6 @@ print(f"Priority ROC-AUC: {roc_auc_score(y_test_p, y_prob):.4f}")
 
 lgbm_model = final_pipe_priority.named_steps['clf']
 te_step = final_pipe_priority.named_steps['te']
-feature_names = models['features_priority'] if 'models' in dir() else FEATURES_PRIORITY
 fi_scores = lgbm_model.feature_importances_
 fi_df = pd.DataFrame({'feature': FEATURES_PRIORITY, 'importance': fi_scores})
 fi_df = fi_df.sort_values('importance', ascending=False).head(10)
