@@ -418,14 +418,21 @@ The **Model Monitoring** page (Page 6 in the Streamlit dashboard) provides real-
 ## 🚀 How to Run the Project
 
 ### Prerequisite Environment
-Make sure Python 3.8+ is installed on your system.
+* Make sure Python 3.8+ is installed on your system.
+* Make sure Node.js (v18+) is installed to run the Next.js frontend.
 
 ### 1. Install Dependencies
-Install all required packages from `requirements.txt`. E.g.:
+Install all required packages from `requirements.txt`:
 ```bash
 pip install -r requirements.txt
 ```
 *(Note: We use `pygeohash` which is pure-Python and runs on Windows without requiring Rust/C++ compilation tools).*
+
+To set up the frontend:
+```bash
+cd frontend
+npm install
+```
 
 ### 2. Run the Model Training Pipeline
 To run the preprocessing steps, train the models, perform cross-validation, and export lookup files:
@@ -438,28 +445,31 @@ This command generates the following artifacts in the `models/` directory:
 * `dbscan_clusterer.pkl` / `cluster_profiles.pkl` (spatial clustering files)
 * Lookups and configs (`geohash_lookup.pkl`, `zone_hour_lookup.pkl`, `corridor_risk_lookup.pkl`, `global_medians.pkl`, and `closure_best_threshold.pkl`)
 
-### 3. Start the Streamlit Dashboard
-Launch the interactive visual dashboard:
+### 3. Start the Backend REST API
+The Next.js frontend communicates with the FastAPI backend. Start it using:
+```bash
+python -m uvicorn api:app --host 127.0.0.1 --port 8000
+```
+Visit [http://localhost:8000/docs](http://localhost:8000/docs) for the interactive Swagger documentation.
+
+### 4. Start the Next.js Frontend Web App
+In a new terminal window, navigate to the `frontend` folder and run:
+```bash
+cd frontend
+npm run dev
+```
+*(Note: On Windows, if script execution is disabled, you can use `cmd /c npm run dev`).*
+
+Open [http://localhost:3000](http://localhost:3000) in your browser to interact with the Next.js React client application.
+
+### 5. Start the Streamlit Dashboard (Alternative Interface)
+If you prefer to run the unified Python Streamlit dashboard instead:
 ```bash
 python -m streamlit run app.py
 ```
+Open [http://localhost:8501](http://localhost:8501) in your browser to view pages for Predictor, Hotspot Maps, Analytics, Model Reports, and Chatbot.
 
-Open [http://localhost:8501](http://localhost:8501) in your browser to interact with the dashboard:
-* **🔮 Event Impact Predictor**: Feed live parameters to predict priority/road closure and receive resource recommendations.
-* **🗺️ Hotspot Map**: Track density hotspots in Bengaluru.
-* **📊 Dataset Analytics**: Run charts explaining event causes, hour peaks, and zones.
-* **📋 Model Performance**: Inspect validation scores and feature importance.
-* **💬 ASTRAM Assistant**: Chat with the AI assistant to get predictions, explore hotspots, and understand models through natural language.
-* **📡 Model Monitoring**: Track prediction quality, detect drift, and monitor online learning status.
-
-### 4. Start the REST API (Optional)
-For external system integrations:
-```bash
-uvicorn api:app --host 0.0.0.0 --port 8000 --reload
-```
-Visit [http://localhost:8000/docs](http://localhost:8000/docs) for interactive Swagger documentation.
-
-### 5. Run Online Learning (Optional)
+### 6. Run Online Learning & Drift Detection
 To incrementally retrain models or check for drift:
 ```bash
 # Incremental retrain on the last 6 months
@@ -468,6 +478,11 @@ python online_update.py --retrain --window-months 6
 # Check drift in prediction logs
 python online_update.py --drift
 ```
+
+---
+
+## 📖 Feature Guide & Explanation
+For a detailed guide on the project's models, recommendations, NLU chatbot, drift detection, and lookup architectures, see [FEATURES_EXPLANATION.md](file:///c:/Users/shubh/OneDrive/Desktop/event-driven%20congestion/FEATURES_EXPLANATION.md).
 
 ---
 
