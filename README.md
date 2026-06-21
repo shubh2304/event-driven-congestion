@@ -1,3 +1,12 @@
+---
+title: Astram API
+emoji: 🚦
+colorFrom: indigo
+colorTo: blue
+sdk: docker
+pinned: false
+---
+
 # 🚦 Event-Driven Congestion Forecasting System — ASTRAM
 #SKMKB
 
