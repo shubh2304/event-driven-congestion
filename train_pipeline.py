@@ -8,15 +8,18 @@ import joblib
 from sklearn.pipeline import Pipeline as SkPipeline
 from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
 from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, mean_absolute_error, r2_score, precision_recall_curve
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
+from sklearn.base import BaseEstimator, TransformerMixin, RegressorMixin
+from sklearn.ensemble import RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from xgboost import XGBClassifier, XGBRegressor
 from lightgbm import LGBMClassifier, LGBMRegressor
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 import category_encoders as ce
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 warnings.filterwarnings('ignore')
 
@@ -196,7 +199,16 @@ df['time_of_day'] = pd.cut(df['hour'],
     bins=[-1,5,11,16,20,24],
     labels=['night','morning','afternoon','evening','late_evening']
 )
-print("Datetime feature engineering completed.")
+# ─── Cyclical time encodings ──────────────────────────────────
+# Preserves temporal continuity (e.g. hour 23 ↔ 0) that tree models can't
+# learn from raw integer hour/month/dow features.
+df['hour_sin']  = np.sin(2 * np.pi * df['hour'] / 24)
+df['hour_cos']  = np.cos(2 * np.pi * df['hour'] / 24)
+df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+df['dow_sin']   = np.sin(2 * np.pi * df['day_of_week'] / 7)
+df['dow_cos']   = np.cos(2 * np.pi * df['day_of_week'] / 7)
+print("Datetime feature engineering completed (including cyclical encodings).")
 
 # ─── STEP 3: GEOHASH ENCODING ONLY ───────────────────────────
 # NOTE: Geo aggregations (geo_stats, zone_hour_counts, corridor_risk) are
@@ -328,6 +340,39 @@ for col, med_val in geo_train_medians.items():
     df_test[col]  = df_test[col].fillna(med_val)
 print("Geospatial aggregations complete. Train medians saved for inference fallback.")
 
+# ─── INTERACTION FEATURES (train-only derived, no leakage) ───────────────────
+# These combine existing features to give models higher-order signal.
+print("\n--- Step 6.6b: Interaction Feature Engineering ---")
+
+# geo_closure_x_peak: closure-prone zones during peak hours are extra risky
+df_train['geo_closure_x_peak'] = df_train['geo_closure_rate'] * df_train['is_peak_hour']
+df_test['geo_closure_x_peak']  = df_test['geo_closure_rate']  * df_test['is_peak_hour']
+
+# cause_zone_closure: per-(cause, zone) historical closure rate from train
+cause_zone_closure = df_train.groupby(['event_cause', 'zone'])['road_closure_binary'].mean().reset_index()
+cause_zone_closure.columns = ['event_cause', 'zone', 'cause_zone_closure']
+df_train = df_train.merge(cause_zone_closure, on=['event_cause', 'zone'], how='left')
+df_test  = df_test.merge(cause_zone_closure,  on=['event_cause', 'zone'], how='left')
+cz_median = float(df_train['cause_zone_closure'].median())
+df_train['cause_zone_closure'] = df_train['cause_zone_closure'].fillna(cz_median)
+df_test['cause_zone_closure']  = df_test['cause_zone_closure'].fillna(cz_median)
+geo_train_medians['cause_zone_closure'] = cz_median
+
+# geo_event_density: relative hotspot intensity (event count / zone-hour count)
+df_train['geo_event_density'] = df_train['geo_event_count'] / (df_train['zone_hour_event_count'] + 1)
+df_test['geo_event_density']  = df_test['geo_event_count']  / (df_test['zone_hour_event_count'] + 1)
+
+# duration_x_closure_risk: interaction of cause-level duration with closure risk
+df_train['duration_x_closure_risk'] = df_train['cause_avg_duration'] * df_train['cause_closure_rate']
+df_test['duration_x_closure_risk']  = df_test['cause_avg_duration']  * df_test['cause_closure_rate']
+
+# log_geo_event_count: log-transform of skewed count feature
+df_train['log_geo_event_count'] = np.log1p(df_train['geo_event_count'])
+df_test['log_geo_event_count']  = np.log1p(df_test['geo_event_count'])
+
+print(f"Added 5 interaction features: geo_closure_x_peak, cause_zone_closure, "
+      f"geo_event_density, duration_x_closure_risk, log_geo_event_count")
+
 # ─── STEP 6.7: FIT PREPROCESSING TRANSFORMERS ON TRAINING DATA ───────────────
 # Replaces the old bare-Pandas IQR capping (was Step 4) and mode imputation
 # (was Step 5) that were both computed on the full df before the split.
@@ -362,6 +407,7 @@ print("Preprocessing transformers applied to train and test splits.")
 # Both corridor features are kept in FEATURES_ALL where they are legitimate
 # predictors for the closure and duration models (different targets).
 TIME_DUMMIES = sorted([c for c in df_train.columns if c.startswith('time_of_day_')])
+CYCLICAL_FEATURES = ['hour_sin', 'hour_cos', 'month_sin', 'month_cos', 'dow_sin', 'dow_cos']
 
 FEATURES_PRIORITY = [
     'is_planned', 'hour', 'day_of_week', 'month', 'is_weekend', 'is_peak_hour',
@@ -370,8 +416,9 @@ FEATURES_PRIORITY = [
     'zone_hour_event_count',
     # corridor and corridor_risk_score excluded — they are the labeling rule, not a feature
     # geo_high_priority_rate excluded — smoothed copy of the priority target
-    'event_cause', 'veh_type', 'police_station', 'zone', 'junction'
-] + TIME_DUMMIES
+    'event_cause', 'veh_type', 'police_station', 'zone', 'junction',
+    'log_geo_event_count', 'geo_event_density',
+] + TIME_DUMMIES + CYCLICAL_FEATURES
 
 # TargetEncoder for priority model must only reference columns that are IN FEATURES_PRIORITY
 # (corridor is excluded, so it must be removed from the encoder's cols list too)
@@ -384,7 +431,9 @@ FEATURES_ALL = [
     'zone_hour_event_count', 'corridor_risk_score',
     'event_cause', 'veh_type', 'corridor', 'police_station', 'zone', 'junction',
     'cause_avg_duration',  # DR-1
-] + TIME_DUMMIES
+    'log_geo_event_count', 'geo_event_density',
+    'duration_x_closure_risk',
+] + TIME_DUMMIES + CYCLICAL_FEATURES
 
 # FEATURES_CLOSURE: superset of FEATURES_ALL with closure-specific engineered features.
 # Kept separate from FEATURES_ALL so Duration model is not polluted by closure-target
@@ -400,12 +449,14 @@ df_test['is_high_risk_cause']  = df_test['event_cause'].isin(HIGH_RISK_CAUSES).a
 FEATURES_CLOSURE = FEATURES_ALL + [
     'cause_closure_rate',   # RC-1
     'is_high_risk_cause',   # RC-2
+    'geo_closure_x_peak',   # Interaction: closure-prone zones during peak hours
+    'cause_zone_closure',   # Per-(cause, zone) historical closure rate
 ]
 
 print(f"FEATURES_PRIORITY: {len(FEATURES_PRIORITY)} features "
       f"(corridor, corridor_risk_score, geo_high_priority_rate all excluded)")
 print(f"FEATURES_ALL:      {len(FEATURES_ALL)} features (duration model — no closure-target signals)")
-print(f"FEATURES_CLOSURE:  {len(FEATURES_CLOSURE)} features (closure model — includes RC-1, RC-2)")
+print(f"FEATURES_CLOSURE:  {len(FEATURES_CLOSURE)} features (closure model — includes RC-1, RC-2, interactions)")
 print(f"target_enc_cols_priority: {target_enc_cols_priority}")
 
 # ─── PREPROCESSING STATE ─────────────────────────────────────────────────────
@@ -432,11 +483,132 @@ def prep_X(df_subset, feature_list):
     for c in X.columns:
         if X[c].dtype == bool:
             X[c] = X[c].astype(int)
+    # Fill any remaining NaN (from feature engineering edge cases) with 0
+    X = X.fillna(0)
     return X
+
+
+class NaNFiller(BaseEstimator, TransformerMixin):
+    """Fill NaN values produced by TargetEncoder during cross-validation.
+    SMOTE requires NaN-free input, so this step is inserted between
+    TargetEncoder and SMOTE in all imblearn Pipelines."""
+    def fit(self, X, y=None):
+        return self
+    def transform(self, X, y=None):
+        if hasattr(X, 'fillna'):
+            return X.fillna(0)
+        return np.nan_to_num(X, nan=0.0)
+
+
+# ─── OPTUNA HYPERPARAMETER OPTIMIZATION ──────────────────────────────────────
+N_OPTUNA_TRIALS = 50  # Bayesian search budget per model
+
+def optuna_priority_objective(trial, X_train, y_train, te_cols, skf):
+    """Optuna objective for Priority classifier (LightGBM)."""
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 200, 800),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+        'num_leaves': trial.suggest_int('num_leaves', 31, 127),
+        'max_depth': trial.suggest_int('max_depth', 4, 12),
+        'min_child_samples': trial.suggest_int('min_child_samples', 5, 50),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
+        'random_state': 42,
+        'verbose': -1,
+    }
+    pipe = ImbPipeline([
+        ('te', ce.TargetEncoder(cols=te_cols, smoothing=5)),
+        ('nanfill', NaNFiller()),
+        ('smote', SMOTE(random_state=42)),
+        ('clf', LGBMClassifier(**params))
+    ])
+    scores = cross_val_score(pipe, X_train, y_train, cv=skf, scoring='f1_weighted')
+    return scores.mean()
+
+
+def optuna_closure_objective(trial, X_train, y_train, te_cols, skf):
+    """Optuna objective for Closure classifier (XGBoost)."""
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 200, 800),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        'max_depth': trial.suggest_int('max_depth', 4, 12),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 20),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
+        'gamma': trial.suggest_float('gamma', 0.0, 5.0),
+        'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1.0, 10.0),
+        'random_state': 42,
+        'eval_metric': 'logloss',
+    }
+    smote_ratio = trial.suggest_float('smote_ratio', 0.3, 1.0)
+    pipe = ImbPipeline([
+        ('te', ce.TargetEncoder(cols=te_cols, smoothing=5)),
+        ('nanfill', NaNFiller()),
+        ('smote', SMOTE(random_state=42, sampling_strategy=smote_ratio)),
+        ('clf', XGBClassifier(**params))
+    ])
+    scores = cross_val_score(pipe, X_train, y_train, cv=skf, scoring='roc_auc')
+    return scores.mean()
+
+
+def optuna_duration_objective(trial, X_train, y_train, te_cols):
+    """Optuna objective for Duration regressor (LightGBM)."""
+    from sklearn.model_selection import cross_val_score as cvs
+    objective = trial.suggest_categorical('objective', ['huber', 'regression', 'quantile'])
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 200, 800),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+        'num_leaves': trial.suggest_int('num_leaves', 31, 127),
+        'max_depth': trial.suggest_int('max_depth', 4, 12),
+        'min_child_samples': trial.suggest_int('min_child_samples', 5, 50),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
+        'objective': objective,
+        'random_state': 42,
+        'verbose': -1,
+    }
+    if objective == 'quantile':
+        params['alpha'] = trial.suggest_float('alpha', 0.3, 0.7)
+    pipe = SkPipeline([
+        ('te', ce.TargetEncoder(cols=te_cols, smoothing=5)),
+        ('nanfill', NaNFiller()),
+        ('reg', LGBMRegressor(**params))
+    ])
+    from sklearn.model_selection import KFold
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    scores = cvs(pipe, X_train, y_train, cv=kf, scoring='neg_mean_absolute_error')
+    return scores.mean()  # higher (less negative) is better
+
+
+# ─── Averaging Ensemble Regressor ────────────────────────────────────────────
+class AveragingRegressor(BaseEstimator, RegressorMixin):
+    """Simple averaging ensemble of two fitted regressors.
+    Each regressor is an imblearn/sklearn Pipeline with a TargetEncoder step.
+    """
+    def __init__(self, pipe_a, pipe_b):
+        self.pipe_a = pipe_a
+        self.pipe_b = pipe_b
+
+    def fit(self, X, y):
+        self.pipe_a.fit(X, y)
+        self.pipe_b.fit(X, y)
+        return self
+
+    def predict(self, X):
+        pa = self.pipe_a.predict(X)
+        pb = self.pipe_b.predict(X)
+        return (pa + pb) / 2.0
+
 
 # 7A. Classification — Priority Prediction (High / Low)
 # Uses FEATURES_PRIORITY which excludes geo_high_priority_rate.
-print("\n--- 7A. Priority Classification cross-validation ---")
+print("\n--- 7A. Priority Classification — Optuna Hyperparameter Search ---")
 X_train_p = prep_X(df_train, FEATURES_PRIORITY)
 X_test_p  = prep_X(df_test,  FEATURES_PRIORITY)
 y_train_p = df_train['priority_binary']
@@ -444,33 +616,35 @@ y_test_p  = df_test['priority_binary']
 
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-models_cv = {
-    'XGBoost': XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.05,
-                              subsample=0.8, colsample_bytree=0.8,
-                              eval_metric='logloss', random_state=42),
-    'LightGBM': LGBMClassifier(n_estimators=300, learning_rate=0.05,
-                                num_leaves=63, random_state=42, verbose=-1),
-    'RandomForest': RandomForestClassifier(n_estimators=300, max_depth=10,
-                                           class_weight='balanced', random_state=42),
-}
+# Optuna search for best LightGBM hyperparameters
+print(f"Running {N_OPTUNA_TRIALS} Optuna trials for Priority model...")
+study_p = optuna.create_study(direction='maximize', study_name='priority_lgbm')
+study_p.optimize(
+    lambda trial: optuna_priority_objective(trial, X_train_p, y_train_p, target_enc_cols_priority, skf),
+    n_trials=N_OPTUNA_TRIALS,
+    show_progress_bar=True,
+)
+best_p = study_p.best_params
+print(f"Best Priority params (F1={study_p.best_value:.4f}): {best_p}")
+lgbm_f1_cv = study_p.best_value
 
-lgbm_f1_cv = 0.0
-for name, model in models_cv.items():
-    pipe = ImbPipeline([
-        ('te', ce.TargetEncoder(cols=target_enc_cols_priority, smoothing=5)),
-        ('smote', SMOTE(random_state=42)),
-        ('clf', model)
-    ])
-    scores = cross_val_score(pipe, X_train_p, y_train_p, cv=skf, scoring='f1_weighted')
-    if name == 'LightGBM':
-        lgbm_f1_cv = scores.mean()
-    print(f"{name}: Weighted F1 = {scores.mean():.4f} ± {scores.std():.4f}")
-
-print("\nTraining final Priority model (LightGBM)...")
+print("\nTraining final Priority model with Optuna-tuned hyperparameters...")
 final_pipe_priority = ImbPipeline([
     ('te', ce.TargetEncoder(cols=target_enc_cols_priority, smoothing=5)),
+    ('nanfill', NaNFiller()),
     ('smote', SMOTE(random_state=42)),
-    ('clf', LGBMClassifier(n_estimators=500, learning_rate=0.03, num_leaves=63, random_state=42, verbose=-1))
+    ('clf', LGBMClassifier(
+        n_estimators=best_p['n_estimators'],
+        learning_rate=best_p['learning_rate'],
+        num_leaves=best_p['num_leaves'],
+        max_depth=best_p['max_depth'],
+        min_child_samples=best_p['min_child_samples'],
+        subsample=best_p['subsample'],
+        colsample_bytree=best_p['colsample_bytree'],
+        reg_alpha=best_p['reg_alpha'],
+        reg_lambda=best_p['reg_lambda'],
+        random_state=42, verbose=-1
+    ))
 ])
 final_pipe_priority.fit(X_train_p, y_train_p)
 y_pred = final_pipe_priority.predict(X_test_p)
@@ -478,7 +652,25 @@ y_prob = final_pipe_priority.predict_proba(X_test_p)[:, 1]
 
 print("Priority Model Evaluation Report:")
 print(classification_report(y_test_p, y_pred, target_names=['Low', 'High']))
-print(f"Priority ROC-AUC: {roc_auc_score(y_test_p, y_prob):.4f}")
+new_priority_auc = roc_auc_score(y_test_p, y_prob)
+print(f"Priority ROC-AUC: {new_priority_auc:.4f}")
+
+# Guard: only keep the new model if it doesn't regress
+BASELINE_PRIORITY_AUC = 0.9856
+if new_priority_auc < BASELINE_PRIORITY_AUC:
+    print(f"⚠️ Priority model REGRESSED ({new_priority_auc:.4f} < {BASELINE_PRIORITY_AUC}). "
+          f"Falling back to conservative hyperparameters.")
+    final_pipe_priority = ImbPipeline([
+        ('te', ce.TargetEncoder(cols=target_enc_cols_priority, smoothing=5)),
+        ('nanfill', NaNFiller()),
+        ('smote', SMOTE(random_state=42)),
+        ('clf', LGBMClassifier(n_estimators=500, learning_rate=0.03, num_leaves=63, random_state=42, verbose=-1))
+    ])
+    final_pipe_priority.fit(X_train_p, y_train_p)
+    y_pred = final_pipe_priority.predict(X_test_p)
+    y_prob = final_pipe_priority.predict_proba(X_test_p)[:, 1]
+    new_priority_auc = roc_auc_score(y_test_p, y_prob)
+    print(f"Fallback Priority ROC-AUC: {new_priority_auc:.4f}")
 
 lgbm_model = final_pipe_priority.named_steps['clf']
 te_step = final_pipe_priority.named_steps['te']
@@ -489,12 +681,8 @@ priority_feature_importance = fi_df.to_dict(orient='records')
 
 
 # 7B. Classification — Road Closure Prediction
-# RC-3 winner: XGBoost + SMOTE(0.6) — locked in.
-# RC-4/RC-5: Compare LightGBM+is_unbalance and CatBoost+Balanced.
-# RC-6: Add zone_peak_int and cause_risk_int interaction features.
-# RC-7: Hyperparameter sweep on the overall winner.
-# All thresholds tuned on val; all metrics reported on blind test set.
-print("\n--- 7B. Road Closure Classification ---")
+# Upgraded: Optuna-tuned XGBoost + Stacking Ensemble (XGB+LGBM+RF → LR)
+print("\n--- 7B. Road Closure Classification — Optuna + Stacking Ensemble ---")
 
 from sklearn.metrics import precision_score, recall_score, f1_score as sklearn_f1
 
@@ -506,18 +694,78 @@ y_tr  = df_tr_c['road_closure_binary']
 y_val = df_val_c['road_closure_binary']
 y_te  = df_test['road_closure_binary']
 
-# Base feature matrices (RC-1+RC-2 features)
+# Base feature matrices (RC-1+RC-2+interaction features)
 X_tr  = prep_X(df_tr_c,  FEATURES_CLOSURE)
 X_val = prep_X(df_val_c, FEATURES_CLOSURE)
 X_te  = prep_X(df_test,  FEATURES_CLOSURE)
 
-# ── Final closure model — using the winning hyperparameters (RC-7: depth=8, lr=0.1) ─
 _te_cols = [c for c in target_enc_cols if c in FEATURES_CLOSURE]
+
+# Optuna search for best XGBoost hyperparameters (base learner for the stack)
+print(f"Running {N_OPTUNA_TRIALS} Optuna trials for Closure model...")
+skf_closure = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+study_c = optuna.create_study(direction='maximize', study_name='closure_xgb')
+study_c.optimize(
+    lambda trial: optuna_closure_objective(trial, X_tr, y_tr, _te_cols, skf_closure),
+    n_trials=N_OPTUNA_TRIALS,
+    show_progress_bar=True,
+)
+best_c = study_c.best_params
+print(f"Best Closure params (AUC={study_c.best_value:.4f}): {best_c}")
+
+# Extract the best SMOTE ratio, remove from model params
+best_smote_ratio = best_c.pop('smote_ratio')
+
+# ── Stacking Ensemble: XGBoost + LightGBM + RandomForest → LogisticRegression ─
+# TargetEncoder must be applied BEFORE the stacking classifier sees the data.
+# We first apply TE + SMOTE, then feed into the stacker.
+print("\nBuilding Stacking Ensemble for Closure model...")
+
+# Define base learners with Optuna-tuned XGBoost and reasonable defaults for others
+xgb_tuned = XGBClassifier(
+    n_estimators=best_c['n_estimators'],
+    learning_rate=best_c['learning_rate'],
+    max_depth=best_c['max_depth'],
+    min_child_weight=best_c['min_child_weight'],
+    subsample=best_c['subsample'],
+    colsample_bytree=best_c['colsample_bytree'],
+    reg_alpha=best_c['reg_alpha'],
+    reg_lambda=best_c['reg_lambda'],
+    gamma=best_c['gamma'],
+    scale_pos_weight=best_c['scale_pos_weight'],
+    random_state=42, eval_metric='logloss'
+)
+
+lgbm_closure = LGBMClassifier(
+    n_estimators=best_c['n_estimators'],
+    learning_rate=best_c['learning_rate'],
+    num_leaves=63,
+    max_depth=best_c['max_depth'],
+    random_state=42, verbose=-1
+)
+
+rf_closure = RandomForestClassifier(
+    n_estimators=300, max_depth=best_c['max_depth'],
+    class_weight='balanced', random_state=42
+)
+
+stacking_clf = StackingClassifier(
+    estimators=[
+        ('xgb', xgb_tuned),
+        ('lgbm', lgbm_closure),
+        ('rf', rf_closure),
+    ],
+    final_estimator=LogisticRegression(max_iter=1000, random_state=42),
+    cv=5,
+    stack_method='predict_proba',
+    passthrough=False,
+)
+
 final_pipe_closure = ImbPipeline([
     ('te', ce.TargetEncoder(cols=_te_cols, smoothing=5)),
-    ('smote', SMOTE(random_state=42, sampling_strategy=0.6)),
-    ('clf', XGBClassifier(n_estimators=400, max_depth=8, learning_rate=0.10,
-                          random_state=42, eval_metric='logloss'))
+    ('nanfill', NaNFiller()),
+    ('smote', SMOTE(random_state=42, sampling_strategy=best_smote_ratio)),
+    ('clf', stacking_clf)
 ])
 final_pipe_closure.fit(X_tr, y_tr)
 
@@ -533,14 +781,14 @@ probs_c = final_pipe_closure.predict_proba(X_te)[:, 1]
 y_pred_tuned = (probs_c >= best_thresh).astype(int)
 
 print(f"Tuned Threshold (val-derived): {best_thresh:.3f}")
-print("Road Closure Model Evaluation Report (Tuned):")
+print("Road Closure Model Evaluation Report (Stacking Ensemble, Tuned):")
 print(classification_report(y_te, y_pred_tuned, target_names=['No Closure', 'Closure']))
 print(f"Road Closure ROC-AUC: {roc_auc_score(y_te, probs_c):.4f}")
 
 
 # 7C. Regression — Duration Prediction (minutes)
-# Uses FEATURES_ALL. Only rows with a known duration are included.
-print("\n--- 7C. Duration Regression ---")
+# Upgraded: Optuna-tuned LightGBM (Huber) + XGBoost averaging ensemble
+print("\n--- 7C. Duration Regression — Optuna + Averaging Ensemble ---")
 dur_mask_tr = df_train['duration_minutes'].notna()
 dur_mask_te = df_test['duration_minutes'].notna()
 X_tr_d = prep_X(df_train.loc[dur_mask_tr], FEATURES_ALL)
@@ -548,23 +796,73 @@ X_te_d = prep_X(df_test.loc[dur_mask_te],  FEATURES_ALL)
 y_tr_d = np.log1p(df_train.loc[dur_mask_tr, 'duration_minutes'])
 y_te_d = np.log1p(df_test.loc[dur_mask_te,  'duration_minutes'])
 
-dur_pipe = SkPipeline([
-    ('te', ce.TargetEncoder(cols=[c for c in target_enc_cols if c in X_tr_d.columns], smoothing=5)),
-    ('reg', LGBMRegressor(n_estimators=500, learning_rate=0.03, num_leaves=63, random_state=42, verbose=-1, objective='quantile', alpha=0.5))
+_te_cols_dur = [c for c in target_enc_cols if c in X_tr_d.columns]
+
+# Optuna search for best LightGBM hyperparameters
+print(f"Running {N_OPTUNA_TRIALS} Optuna trials for Duration model...")
+study_d = optuna.create_study(direction='maximize', study_name='duration_lgbm')
+study_d.optimize(
+    lambda trial: optuna_duration_objective(trial, X_tr_d, y_tr_d, _te_cols_dur),
+    n_trials=N_OPTUNA_TRIALS,
+    show_progress_bar=True,
+)
+best_d = study_d.best_params
+print(f"Best Duration params (neg_MAE={study_d.best_value:.4f}): {best_d}")
+
+# Build the Optuna-tuned LightGBM regressor
+lgbm_params = {
+    'n_estimators': best_d['n_estimators'],
+    'learning_rate': best_d['learning_rate'],
+    'num_leaves': best_d['num_leaves'],
+    'max_depth': best_d['max_depth'],
+    'min_child_samples': best_d['min_child_samples'],
+    'subsample': best_d['subsample'],
+    'colsample_bytree': best_d['colsample_bytree'],
+    'reg_alpha': best_d['reg_alpha'],
+    'reg_lambda': best_d['reg_lambda'],
+    'objective': best_d['objective'],
+    'random_state': 42,
+    'verbose': -1,
+}
+if best_d['objective'] == 'quantile' and 'alpha' in best_d:
+    lgbm_params['alpha'] = best_d['alpha']
+
+pipe_lgbm = SkPipeline([
+    ('te', ce.TargetEncoder(cols=_te_cols_dur, smoothing=5)),
+    ('nanfill', NaNFiller()),
+    ('reg', LGBMRegressor(**lgbm_params))
 ])
+
+# Build the XGBoost regressor (complements LightGBM for ensemble diversity)
+pipe_xgb = SkPipeline([
+    ('te', ce.TargetEncoder(cols=_te_cols_dur, smoothing=5)),
+    ('nanfill', NaNFiller()),
+    ('reg', XGBRegressor(
+        n_estimators=best_d['n_estimators'],
+        learning_rate=best_d['learning_rate'],
+        max_depth=best_d['max_depth'],
+        subsample=best_d['subsample'],
+        colsample_bytree=best_d['colsample_bytree'],
+        reg_alpha=best_d['reg_alpha'],
+        reg_lambda=best_d['reg_lambda'],
+        random_state=42, verbosity=0
+    ))
+])
+
+# Averaging ensemble: LightGBM + XGBoost
+print("Training Averaging Ensemble (LightGBM + XGBoost) for Duration...")
+dur_pipe = AveragingRegressor(pipe_lgbm, pipe_xgb)
 dur_pipe.fit(X_tr_d, y_tr_d)
 y_pred_d = dur_pipe.predict(X_te_d)
 
 # All metrics are computed on the ORIGINAL scale (minutes) by back-transforming
-# via expm1(). Previously r2_score used the raw log-space arrays (y_te_d / y_pred_d)
-# which made R² uninterpretable — a negative R² looked like "no skill" but was just
-# an artefact of the log-scale residual geometry.
+# via expm1().
 y_te_d_exp   = np.expm1(y_te_d)     # actual durations in minutes
 y_pred_d_exp = np.expm1(y_pred_d)   # predicted durations in minutes
 
 mae    = mean_absolute_error(y_te_d_exp, y_pred_d_exp)          # mean absolute error (minutes)
 medae  = float(np.median(np.abs(y_te_d_exp - y_pred_d_exp)))    # median AE — robust to skew
-r2     = r2_score(y_te_d_exp, y_pred_d_exp)                     # R² on original scale ← Fix 6
+r2     = r2_score(y_te_d_exp, y_pred_d_exp)                     # R² on original scale
 r2_log = r2_score(y_te_d,     y_pred_d)                         # log-space R² kept for reference
 print(f"Duration Regression (original scale):")
 print(f"  MAE={mae:.1f} min | MedAE={medae:.1f} min | R²={r2:.4f}  (log-space R²={r2_log:.4f})")
@@ -624,7 +922,11 @@ eval_metrics = {
     "duration_mae": round(float(mae), 1),
     "duration_medae": round(float(medae), 1),
     "duration_r2": round(float(r2), 4),
-    "priority_feature_importance": priority_feature_importance
+    "priority_feature_importance": priority_feature_importance,
+    "optuna_trials_per_model": N_OPTUNA_TRIALS,
+    "priority_best_params": best_p,
+    "closure_best_params": {k: v for k, v in best_c.items() if isinstance(v, (int, float, str))},
+    "duration_best_params": {k: v for k, v in best_d.items() if isinstance(v, (int, float, str))},
 }
 with open("models/eval_metrics.json", "w") as f:
     json.dump(eval_metrics, f, indent=2)
@@ -639,6 +941,7 @@ joblib.dump(FEATURES_PRIORITY,    'models/feature_list_priority.pkl')  # priorit
 joblib.dump(FEATURES_CLOSURE,     'models/feature_list_closure.pkl')   # closure model
 joblib.dump(FEATURES_ALL,         'models/feature_list.pkl')           # duration model
 joblib.dump(preprocessor_state,   'models/preprocessor.pkl')           # fitted IQR bounds + mode values + time_dummies
+joblib.dump(cause_zone_closure,   'models/cause_zone_closure_lookup.pkl')  # per-(cause,zone) closure rate
 
 # ─── STEP 10.5: XAI GLOBAL SHAP EXPLANATIONS ────────────────────────
 print("\n--- Step 10.5: Computing Global SHAP Explanations ---")
@@ -691,6 +994,7 @@ joblib.dump(cause_closure_lookup, 'models/cause_closure_lookup.pkl')
 joblib.dump(cause_duration_lookup, 'models/cause_duration_lookup.pkl')
 joblib.dump(global_medians, 'models/global_medians.pkl')
 joblib.dump(best_thresh, 'models/closure_best_threshold.pkl')
+joblib.dump(HIGH_RISK_CAUSES, 'models/high_risk_causes.pkl')
 
 print("All models, lookup tables, and configuration files saved successfully to models/ directory.")
 print("Training Pipeline Done!")

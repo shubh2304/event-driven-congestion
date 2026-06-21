@@ -105,6 +105,11 @@ async def lifespan(app: FastAPI):
             'preprocessor':      joblib.load('models/preprocessor.pkl'),
             'eval_metrics':      json.load(open('models/eval_metrics.json')),
         }
+        # Load optional new lookups (added by efficiency upgrade)
+        if os.path.exists('models/cause_zone_closure_lookup.pkl'):
+            models['cause_zone_closure_lookup'] = joblib.load('models/cause_zone_closure_lookup.pkl')
+        if os.path.exists('models/high_risk_causes.pkl'):
+            models['high_risk_causes'] = joblib.load('models/high_risk_causes.pkl')
         print("[OK] All models loaded successfully.")
     except Exception as e:
         print(f"[ERROR] Model loading failed: {e}")
@@ -291,7 +296,33 @@ async def predict(event: EventInput):
         'cause_closure_rate': cause_closure_rate,
         'cause_avg_duration': cause_avg_duration,
         'is_high_risk_cause': int(cause_closure_rate >= 0.3),
+        # Cyclical time features
+        'hour_sin': float(np.sin(2 * np.pi * event.hour / 24)),
+        'hour_cos': float(np.cos(2 * np.pi * event.hour / 24)),
+        'month_sin': float(np.sin(2 * np.pi * event.month / 12)),
+        'month_cos': float(np.cos(2 * np.pi * event.month / 12)),
+        'dow_sin': float(np.sin(2 * np.pi * event.day_of_week / 7)),
+        'dow_cos': float(np.cos(2 * np.pi * event.day_of_week / 7)),
+        # Interaction features
+        'geo_closure_x_peak': geo_closure_rate * int(event.hour in [7, 8, 9, 17, 18, 19, 20]),
+        'geo_event_density': geo_event_count / (zone_hour_event_count + 1),
+        'duration_x_closure_risk': cause_avg_duration * cause_closure_rate,
+        'log_geo_event_count': float(np.log1p(geo_event_count)),
     }
+
+    # Cause-zone closure rate lookup (interaction feature)
+    cz_lookup = models.get('cause_zone_closure_lookup')
+    if cz_lookup is not None and isinstance(cz_lookup, pd.DataFrame):
+        cz_match = cz_lookup[
+            (cz_lookup['event_cause'] == event.event_cause) &
+            (cz_lookup['zone'] == event.zone)
+        ]
+        if not cz_match.empty:
+            input_dict['cause_zone_closure'] = float(cz_match['cause_zone_closure'].iloc[0])
+        else:
+            input_dict['cause_zone_closure'] = gm.get('cause_zone_closure', 0.0)
+    else:
+        input_dict['cause_zone_closure'] = gm.get('cause_zone_closure', 0.0)
 
     for dummy_col in models['preprocessor']['time_dummies']:
         label = dummy_col.replace('time_of_day_', '')

@@ -1,51 +1,88 @@
 {
-  "priority_roc_auc": 0.9856,
-  "priority_f1_weighted": 0.9625,
-  "closure_roc_auc": 0.7054,
-  "closure_best_threshold": 0.207,
-  "duration_mae": 52.1,
-  "duration_medae": 29.7,
-  "duration_r2": 0.2744,
+  "priority_roc_auc": 0.9869,
+  "priority_f1_weighted": 0.9627,
+  "closure_roc_auc": 0.7222,
+  "closure_best_threshold": 0.617,
+  "duration_mae": 53.3,
+  "duration_medae": 32.4,
+  "duration_r2": 0.3029,
   "priority_feature_importance": [
     {
       "feature": "longitude",
-      "importance": 6600
+      "importance": 3902
     },
     {
       "feature": "latitude",
-      "importance": 6008
-    },
-    {
-      "feature": "geo_event_count",
-      "importance": 3107
+      "importance": 3679
     },
     {
       "feature": "geo_avg_duration",
-      "importance": 2979
+      "importance": 2072
     },
     {
       "feature": "police_station",
-      "importance": 2224
+      "importance": 1613
+    },
+    {
+      "feature": "geo_event_density",
+      "importance": 1146
+    },
+    {
+      "feature": "geo_event_count",
+      "importance": 1088
     },
     {
       "feature": "geo_closure_rate",
-      "importance": 1755
+      "importance": 1043
     },
     {
-      "feature": "junction",
-      "importance": 1445
-    },
-    {
-      "feature": "hour",
-      "importance": 1240
+      "feature": "log_geo_event_count",
+      "importance": 866
     },
     {
       "feature": "event_cause",
-      "importance": 1172
+      "importance": 754
     },
     {
-      "feature": "day_of_week",
-      "importance": 1125
+      "feature": "junction",
+      "importance": 639
     }
-  ]
+  ],
+  "optuna_trials_per_model": 50,
+  "priority_best_params": {
+    "n_estimators": 561,
+    "learning_rate": 0.0840144437670289,
+    "num_leaves": 41,
+    "max_depth": 10,
+    "min_child_samples": 8,
+    "subsample": 0.7341584290265873,
+    "colsample_bytree": 0.6966615541333306,
+    "reg_alpha": 0.006042405574077317,
+    "reg_lambda": 0.004088198468089735
+  },
+  "closure_best_params": {
+    "n_estimators": 390,
+    "learning_rate": 0.01627505270478798,
+    "max_depth": 4,
+    "min_child_weight": 12,
+    "subsample": 0.768569961753646,
+    "colsample_bytree": 0.5679348730067665,
+    "reg_alpha": 0.04625657827597539,
+    "reg_lambda": 0.28221218224332495,
+    "gamma": 0.6129109606834136,
+    "scale_pos_weight": 1.6348975359637337
+  },
+  "duration_best_params": {
+    "objective": "quantile",
+    "n_estimators": 685,
+    "learning_rate": 0.014102787045344742,
+    "num_leaves": 127,
+    "max_depth": 5,
+    "min_child_samples": 10,
+    "subsample": 0.6370478939956747,
+    "colsample_bytree": 0.658544927123443,
+    "reg_alpha": 0.025966078488488822,
+    "reg_lambda": 0.12009096768465712,
+    "alpha": 0.5110822948355019
+  }
 }

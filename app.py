@@ -166,6 +166,9 @@ def load_models():
         'closure_best_thresh': joblib.load('models/closure_best_threshold.pkl'),
         'preprocessor':      joblib.load('models/preprocessor.pkl'),            # IQR bounds + mode values + time_dummies
         'eval_metrics':      json.load(open('models/eval_metrics.json')),
+        # New lookups for efficiency upgrade (loaded if available)
+        'cause_zone_closure_lookup': joblib.load('models/cause_zone_closure_lookup.pkl') if os.path.exists('models/cause_zone_closure_lookup.pkl') else None,
+        'high_risk_causes': joblib.load('models/high_risk_causes.pkl') if os.path.exists('models/high_risk_causes.pkl') else None,
     }
 
 # Safe model load
@@ -378,7 +381,33 @@ if page == "🔮 Event Impact Predictor":
             'cause_closure_rate': cause_closure_rate,
             'cause_avg_duration': cause_avg_duration,
             'is_high_risk_cause': int(cause_closure_rate >= 0.3),
+            # Cyclical time features
+            'hour_sin': float(np.sin(2 * np.pi * event_hour / 24)),
+            'hour_cos': float(np.cos(2 * np.pi * event_hour / 24)),
+            'month_sin': float(np.sin(2 * np.pi * event_month / 12)),
+            'month_cos': float(np.cos(2 * np.pi * event_month / 12)),
+            'dow_sin': float(np.sin(2 * np.pi * day_map[event_day] / 7)),
+            'dow_cos': float(np.cos(2 * np.pi * day_map[event_day] / 7)),
+            # Interaction features
+            'geo_closure_x_peak': geo_closure_rate * int(event_hour in [7,8,9,17,18,19,20]),
+            'geo_event_density': geo_event_count / (zone_hour_event_count + 1),
+            'duration_x_closure_risk': cause_avg_duration * cause_closure_rate,
+            'log_geo_event_count': float(np.log1p(geo_event_count)),
         }
+
+        # Cause-zone closure rate lookup
+        cz_lookup = models.get('cause_zone_closure_lookup')
+        if cz_lookup is not None and isinstance(cz_lookup, pd.DataFrame):
+            cz_match = cz_lookup[
+                (cz_lookup['event_cause'] == event_cause) &
+                (cz_lookup['zone'] == zone)
+            ]
+            if not cz_match.empty:
+                input_dict['cause_zone_closure'] = float(cz_match['cause_zone_closure'].iloc[0])
+            else:
+                input_dict['cause_zone_closure'] = global_medians.get('cause_zone_closure', 0.0)
+        else:
+            input_dict['cause_zone_closure'] = global_medians.get('cause_zone_closure', 0.0)
 
         # Add time_of_day OHE dummies using the exact column list saved at training time.
         # This replaces a hardcoded ['morning','afternoon','evening','late_evening'] list
