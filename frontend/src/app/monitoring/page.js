@@ -115,7 +115,7 @@ export default function MonitoringPage() {
             <IconChart size={20} />
             Prediction Volume
           </h2>
-          <div className="metrics-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+          <div className="metrics-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
             <MetricCard icon={<IconDatabase size={18} />} title="Total Predictions" value={predictions.total} delay={0} />
             <MetricCard icon={<IconActivity size={18} />} title="Last 24 Hours" value={predictions.last_24h} delay={100} />
             <MetricCard icon={<IconShield size={18} />} title="Avg Priority Risk" value={`${predictions.avg_priority_risk}%`} delay={200} />

@@ -184,7 +184,7 @@ export default function PredictorPage() {
             Model Predictions & Impact Score
           </h2>
 
-          <div className="metrics-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+          <div className="metrics-grid"  style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))' }}>
             <MetricCard
               icon={<IconShield size={18} />}
               title="Priority Risk"

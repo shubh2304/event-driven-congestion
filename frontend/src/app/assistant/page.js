@@ -110,7 +110,7 @@ export default function AssistantPage() {
 
   return (
     <PageTransition>
-      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+      <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '0.75rem' }}>
         <div>
           <h1 className="page-header__title">ASTRAM Traffic Assistant</h1>
           <p className="page-header__desc">
