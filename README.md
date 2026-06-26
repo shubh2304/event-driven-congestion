@@ -8,7 +8,6 @@ pinned: false
 ---
 
 # 🚦 Event-Driven Congestion Forecasting System — ASTRAM
-#SKMKB
 
 An end-to-end machine learning system and interactive dashboard for forecasting traffic congestion severity in Bengaluru. The system is trained on historical data to predict incident priority, identify road closure risks, forecast congestion durations, cluster active hotspot zones, and recommend field resources (manpower, barricades, and diversions). It also features a **conversational AI chatbot**, **online learning infrastructure** for incremental model updates, **drift detection**, and a **REST API** for external system integrations.
 
@@ -491,7 +490,7 @@ python online_update.py --drift
 ---
 
 ## 📖 Feature Guide & Explanation
-For a detailed guide on the project's models, recommendations, NLU chatbot, drift detection, and lookup architectures, see [FEATURES_EXPLANATION.md](file:///c:/Users/shubh/OneDrive/Desktop/event-driven%20congestion/FEATURES_EXPLANATION.md).
+For a detailed guide on the project's models, recommendations, NLU chatbot, drift detection, and lookup architectures, see [FEATURES_EXPLANATION.md](FEATURES_EXPLANATION.md).
 
 ---
 

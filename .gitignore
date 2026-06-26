@@ -1,2 +1,52 @@
-﻿__pycache__/
+# Python
+__pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log
+
+# Models (large binary files — track via Git LFS or regenerate)
+# models/*.pkl
+# models/*.html
+
+# Generated waterfall/XAI HTML plots
+waterfall_*.html
+
+# Node / Frontend
+node_modules/
+.next/
+out/
+.vercel/
+
+# Docker
+*.tar
+
+# Misc
+*.bak
+*.tmp
